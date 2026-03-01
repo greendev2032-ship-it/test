@@ -240,7 +240,6 @@ __device__ __forceinline__ bool applyNegationMap(uint64_t y[4]) {
       and (x,p-y) share the same x,  giving ~1.4x speedup.
    ================================================================ */
 
-__launch_bounds__(256, 2)
 __global__ void kernel_kangaroo_walk(
     uint64_t* __restrict__ g_Px,
     uint64_t* __restrict__ g_Py,
@@ -747,24 +746,23 @@ static bool loadState(const char* path,
     uint32_t& dpBits) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
-    uint32_t magic = 0;
-    fread(&magic, 4, 1, f);
+    (void)fread(&magic, 4, 1, f);
     if (magic != 0x4B414E47) { fclose(f); return false; }
-    fread(&threadsTotal, 8, 1, f);
-    fread(&totalJumps, 8, 1, f);
-    fread(&dpBits, 4, 1, f);
-    fread(targetX, 8, 4, f);
-    fread(targetY, 8, 4, f);
-    fread(range_start, 8, 4, f);
-    fread(range_end, 8, 4, f);
+    (void)fread(&threadsTotal, 8, 1, f);
+    (void)fread(&totalJumps, 8, 1, f);
+    (void)fread(&dpBits, 4, 1, f);
+    (void)fread(targetX, 8, 4, f);
+    (void)fread(targetY, 8, 4, f);
+    (void)fread(range_start, 8, 4, f);
+    (void)fread(range_end, 8, 4, f);
     h_Px.resize(threadsTotal * 4);
     h_Py.resize(threadsTotal * 4);
     h_dist.resize(threadsTotal * 4);
     h_types.resize(threadsTotal);
-    fread(h_Px.data(),    8, threadsTotal * 4, f);
-    fread(h_Py.data(),    8, threadsTotal * 4, f);
-    fread(h_dist.data(),  8, threadsTotal * 4, f);
-    fread(h_types.data(), 4, threadsTotal, f);
+    (void)fread(h_Px.data(),    8, threadsTotal * 4, f);
+    (void)fread(h_Py.data(),    8, threadsTotal * 4, f);
+    (void)fread(h_dist.data(),  8, threadsTotal * 4, f);
+    (void)fread(h_types.data(), 4, threadsTotal, f);
     fclose(f);
     return true;
 }
@@ -834,19 +832,36 @@ int kangaroo_main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    /* Parse range */
-    size_t colon_pos = range_hex.find(':');
-    if (colon_pos == std::string::npos) {
-        std::cerr << "Error: range format must be start:end\n";
-        return EXIT_FAILURE;
-    }
-    std::string start_hex = range_hex.substr(0, colon_pos);
-    std::string end_hex   = range_hex.substr(colon_pos + 1);
-
+    /* Resume state variables */
+    std::vector<uint64_t> r_Px, r_Py, r_dist;
+    std::vector<uint32_t> r_types;
+    uint64_t threadsTotal = 0;
+    uint64_t totalJumps = 0;
+    uint64_t targetX[4]{0}, targetY[4]{0};
     uint64_t range_start[4]{0}, range_end[4]{0};
-    if (!hexToLE64(start_hex, range_start) || !hexToLE64(end_hex, range_end)) {
-        std::cerr << "Error: invalid range hex\n";
-        return EXIT_FAILURE;
+
+    if (resumeMode) {
+        std::cout << "Loading state from " << save_file << "...\n";
+        if (!loadState(save_file.c_str(), r_Px, r_Py, r_dist, r_types,
+                       threadsTotal, totalJumps, targetX, targetY,
+                       range_start, range_end, dpBits)) {
+            std::cerr << "Failed to load state from " << save_file << "\n";
+            return EXIT_FAILURE;
+        }
+    } else {
+        /* Parse range */
+        size_t colon_pos = range_hex.find(':');
+        if (colon_pos == std::string::npos) {
+            std::cerr << "Error: range format must be start:end\n";
+            return EXIT_FAILURE;
+        }
+        std::string start_hex = range_hex.substr(0, colon_pos);
+        std::string end_hex   = range_hex.substr(colon_pos + 1);
+
+        if (!hexToLE64(start_hex, range_start) || !hexToLE64(end_hex, range_end)) {
+            std::cerr << "Error: invalid range hex\n";
+            return EXIT_FAILURE;
+        }
     }
 
     uint64_t range_width[4];
@@ -854,10 +869,11 @@ int kangaroo_main(int argc, char** argv) {
     host_add256_u64(range_width, 1ULL, range_width);
 
     /* Parse public key */
-    uint64_t targetX[4], targetY[4];
-    if (!parseCompressedPubKey(pubkey_hex, targetX, targetY)) {
-        std::cerr << "Error: invalid compressed public key (expected 02/03 + 32 bytes hex)\n";
-        return EXIT_FAILURE;
+    if (!resumeMode) {
+        if (!parseCompressedPubKey(pubkey_hex, targetX, targetY)) {
+            std::cerr << "Error: invalid compressed public key (expected 02/03 + 32 bytes hex)\n";
+            return EXIT_FAILURE;
+        }
     }
 
     /* CUDA init */
@@ -872,14 +888,19 @@ int kangaroo_main(int argc, char** argv) {
     if (numBlocks == 0)
         numBlocks = (uint32_t)prop.multiProcessorCount * 4u;
 
-    uint64_t threadsTotal = (uint64_t)numBlocks * (uint64_t)threadsPerBlock;
+    if (!resumeMode) {
+        threadsTotal = (uint64_t)numBlocks * (uint64_t)threadsPerBlock;
+    } else {
+        /* On resume, use the block/thread count from the save file */
+        numBlocks = (uint32_t)(threadsTotal / threadsPerBlock);
+    }
     uint64_t numTame = threadsTotal / 2;
     uint64_t numWild = threadsTotal - numTame;
 
     /* --------------------------------------------------------
        Decompress public key Y on GPU
        -------------------------------------------------------- */
-    {
+    if (!resumeMode) {
         uint8_t prefix = (uint8_t)targetY[0];
         uint64_t *d_inX, *d_outX, *d_outY;
         cudaMalloc(&d_inX, 4 * sizeof(uint64_t));
@@ -968,11 +989,13 @@ int kangaroo_main(int argc, char** argv) {
     std::cout << std::left << std::setw(20) << "Target pubkey X"   << " : " << formatHex256(targetX) << "\n";
     std::cout << "-------------------------------------------------------\n";
 
-    /* Build starting scalars on host */
-    std::vector<uint64_t> h_startScalars(threadsTotal * 4, 0);
-    std::vector<uint32_t> h_types(threadsTotal, 0);
+    std::vector<uint64_t> h_startScalars;
+    std::vector<uint32_t> h_types;
 
-    {
+    if (!resumeMode) {
+        h_startScalars.resize(threadsTotal * 4, 0);
+        h_types.resize(threadsTotal, 0);
+
         /* Midpoint: mid = range_start + range_width / 2 */
         uint64_t half_width[4], mid[4];
         half_width[0] = (range_width[0] >> 1) | (range_width[1] << 63);
@@ -1025,28 +1048,34 @@ int kangaroo_main(int argc, char** argv) {
     { int zero = FOUND_NONE; cudaMemcpy(d_foundFlag, &zero, sizeof(int), cudaMemcpyHostToDevice); }
     { unsigned int zero = 0;  cudaMemcpy(d_dpCount, &zero, sizeof(unsigned int), cudaMemcpyHostToDevice); }
 
-    uint64_t *d_startScalars;
-    ck(cudaMalloc(&d_startScalars, threadsTotal * 4 * sizeof(uint64_t)), "alloc startScalars");
-    ck(cudaMemcpy(d_startScalars, h_startScalars.data(), threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy scalars");
-    ck(cudaMemcpy(d_type, h_types.data(), threadsTotal * sizeof(uint32_t), cudaMemcpyHostToDevice), "cpy types");
+    if (!resumeMode) {
+        uint64_t *d_startScalars;
+        ck(cudaMalloc(&d_startScalars, threadsTotal * 4 * sizeof(uint64_t)), "alloc startScalars");
+        ck(cudaMemcpy(d_startScalars, h_startScalars.data(), threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy scalars");
+        ck(cudaMemcpy(d_type, h_types.data(), threadsTotal * sizeof(uint32_t), cudaMemcpyHostToDevice), "cpy types");
 
-    /* Scalar multiply all starting points: P_i = G * scalar_i */
-    {
+        /* Scalar multiply all starting points: P_i = G * scalar_i */
         int bs = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<bs, threadsPerBlock>>>(d_startScalars, d_Px, d_Py, (int)threadsTotal);
         ck(cudaDeviceSynchronize(), "scalarMul init");
-    }
 
-    /* Add Q to wild points: P_wild = G*offset + Q */
-    {
-        int bs = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
+        /* Add Q to wild points: P_wild = G*offset + Q */
         kernel_add_target_to_wild<<<bs, threadsPerBlock>>>(d_Px, d_Py, d_type, threadsTotal);
         ck(cudaDeviceSynchronize(), "addQ to wild");
-    }
 
-    /* Set initial distances (= starting scalars for purpose of tracking) */
-    ck(cudaMemcpy(d_dist, d_startScalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyDeviceToDevice), "cpy dist");
-    cudaFree(d_startScalars);
+        /* Set initial distances (= starting scalars for purpose of tracking) */
+        ck(cudaMemcpy(d_dist, d_startScalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyDeviceToDevice), "cpy dist");
+        cudaFree(d_startScalars);
+    } else {
+        /* Just upload the loaded state */
+        ck(cudaMemcpy(d_Px,   r_Px.data(),   threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy r_Px");
+        ck(cudaMemcpy(d_Py,   r_Py.data(),   threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy r_Py");
+        ck(cudaMemcpy(d_dist, r_dist.data(), threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy r_dist");
+        ck(cudaMemcpy(d_type, r_types.data(),threadsTotal *     sizeof(uint32_t), cudaMemcpyHostToDevice), "cpy r_types");
+        
+        /* Clear memory of vectors to free RAM */
+        r_Px.clear(); r_Py.clear(); r_dist.clear(); r_types.clear();
+    }
 
     /* Memory info */
     {
@@ -1071,10 +1100,7 @@ int kangaroo_main(int argc, char** argv) {
     DPHashTable dpTable;
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
-    uint64_t totalJumps = 0;
-    uint64_t lastJumps = 0;
-    bool found = false;
-    uint64_t solution_privkey[4] = {0};
+    auto tLastSave = t0;
 
     std::vector<DPEntry> hostDPBuffer(KANGAROO_DP_BUFFER_SIZE);
 
@@ -1132,6 +1158,25 @@ int kangaroo_main(int argc, char** argv) {
             std::cout.flush();
             lastJumps = totalJumps;
             tLast = now;
+
+            /* Auto-save state periodically */
+            if (saveIntervalSec > 0) {
+                double dtSave = std::chrono::duration<double>(now - tLastSave).count();
+                if (dtSave >= saveIntervalSec) {
+                    std::vector<uint64_t> sv_Px(threadsTotal*4), sv_Py(threadsTotal*4), sv_dist(threadsTotal*4);
+                    std::vector<uint32_t> sv_types(threadsTotal);
+                    cudaMemcpy(sv_Px.data(),   d_Px,   threadsTotal*4*sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(sv_Py.data(),   d_Py,   threadsTotal*4*sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(sv_dist.data(), d_dist, threadsTotal*4*sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(sv_types.data(), d_type, threadsTotal*sizeof(uint32_t), cudaMemcpyDeviceToHost);
+                    if (saveState(save_file.c_str(), sv_Px.data(), sv_Py.data(), sv_dist.data(),
+                                  sv_types.data(), threadsTotal, dpTable, totalJumps,
+                                  targetX, targetY, range_start, range_end, dpBits)) {
+                        std::cout << "\n[Auto-saved to " << save_file << "]\n";
+                    }
+                    tLastSave = now;
+                }
+            }
         }
     }
 

@@ -848,14 +848,18 @@ int kangaroo_main(int argc, char** argv) {
     }
 
     if (!resumeMode && dpBits == 0) {
-        /* Optimal dpBits based on mean jump length.
-           Mean jump bits ~ (rangeBitLen / 2) - log2(threadsTotal). 
-           We want the average trail to contain about 8 to 16 DPs. */
-        int mBits = (rangeBitLen / 2) - 15; /* assuming ~32k-64k threads on average */
-        if (mBits < 4) mBits = 4;
+        /* Optimal dpBits to prevent DP buffer overflow.
+           We launch threadsTotal * stepsPerLaunch jumps. 
+           Expected DPs = (threadsTotal * stepsPerLaunch) / (2^dpBits).
+           We want to stay safely under KANGAROO_DP_BUFFER_SIZE. */
+        uint64_t jumps_per_launch = (uint64_t)threadsTotal * stepsPerLaunch;
+        int safe_dpBits = 12;
+        while ((jumps_per_launch >> safe_dpBits) > (KANGAROO_DP_BUFFER_SIZE / 2)) {
+            safe_dpBits++;
+        }
         
-        int heur = mBits - 6;
-        if (heur < 5) heur = 5;
+        int heur = safe_dpBits;
+        if (heur < 10) heur = 10;
         if (heur > 24) heur = 24;
         dpBits = heur;
     }
@@ -865,26 +869,17 @@ int kangaroo_main(int argc, char** argv) {
     std::memset(h_jumpDist, 0, sizeof(h_jumpDist));
     std::memset(h_jumpScalars, 0, sizeof(h_jumpScalars));
 
-    /* Calculate optimal base shift for jumps. 
-       In parallel Kangaroo, mean jump should be ~ sqrt(N) / M, not sqrt(N). 
-       This prevents jumping over trails without merging. */
-    int log_threads = 0;
-    for (uint64_t v = threadsTotal; v > 1; v >>= 1) log_threads++;
-
     for (int j = 0; j < KANGAROO_NUM_JUMPS; j++) {
-        int optimal_sqrt_bits = (rangeBitLen / 2) - log_threads;
-        if (optimal_sqrt_bits < 4) optimal_sqrt_bits = 4;
+        uint32_t sqrt_bits = rangeBitLen / 2;
+        if (sqrt_bits < 4) sqrt_bits = 4;
 
-        /* Distribute jumps around the optimal mean */
-        int min_shift = optimal_sqrt_bits / 2;
-        if (min_shift < 1) min_shift = 1;
-
-        int shift = min_shift + (j * optimal_sqrt_bits) / KANGAROO_NUM_JUMPS;
-        if (shift > 250) shift = 250;
+        /* Following standard Kangaroo distribution from collider-main */
+        uint32_t bitPos = sqrt_bits / 4 + (j * sqrt_bits * 3) / (4 * KANGAROO_NUM_JUMPS);
+        if (bitPos > 250) bitPos = 250;
         
-        int limb = shift / 64;
-        int rem = shift % 64;
-        h_jumpDist[j * 4 + limb] = 1ULL << rem;
+        int limb = bitPos / 64;
+        int shift = bitPos % 64;
+        h_jumpDist[j * 4 + limb] = 1ULL << shift;
         for (int k = 0; k < 4; k++)
             h_jumpScalars[j * 4 + k] = h_jumpDist[j * 4 + k];
     }

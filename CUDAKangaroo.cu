@@ -797,6 +797,21 @@ static bool parseCompressedPubKey(const std::string& hex, uint64_t outX[4], uint
 }
 
 /* ================================================================
+   Host helper: estimate total keys
+   ================================================================ */
+
+static long double ld_from_u256(const uint64_t x[4]) {
+    long double res = 0.0L;
+    long double base = 1.0L;
+    long double multiplier = 18446744073709551616.0L; // 2^64
+    for (int i = 0; i < 4; i++) {
+        res += (long double)x[i] * base;
+        base *= multiplier;
+    }
+    return res;
+}
+
+/* ================================================================
    Main Kangaroo entry point
    ================================================================ */
 

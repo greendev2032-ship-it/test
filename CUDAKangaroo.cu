@@ -676,6 +676,7 @@ static void handle_sigint_kangaroo(int) { g_sigint_kangaroo = 1; }
 int kangaroo_main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint_kangaroo);
 
+    /* Parse arguments */
     std::string pubkey_hex, range_hex, save_file = "kangaroo_state.bin";
     bool resumeMode = false;
     uint32_t dpBits = 0; /* 0 means auto-calculate */
@@ -759,7 +760,7 @@ int kangaroo_main(int argc, char** argv) {
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
     if (numBlocks == 0)
-        numBlocks = (uint32_t)prop.multiProcessorCount * 4u;
+        numBlocks = (uint32_t)prop.multiProcessorCount * 128u;
 
     if (!resumeMode) {
         threadsTotal = (uint64_t)numBlocks * (uint64_t)threadsPerBlock;
@@ -808,18 +809,44 @@ int kangaroo_main(int argc, char** argv) {
         }
     }
 
+    if (!resumeMode && dpBits == 0) {
+        /* Optimal dpBits based on mean jump length.
+           Mean jump bits ~ (rangeBitLen / 2) - log2(threadsTotal). 
+           We want the average trail to contain about 8 to 16 DPs. */
+        int mBits = (rangeBitLen / 2) - 15; /* assuming ~32k-64k threads on average */
+        if (mBits < 4) mBits = 4;
+        
+        int heur = mBits - 6;
+        if (heur < 5) heur = 5;
+        if (heur > 24) heur = 24;
+        dpBits = heur;
+    }
+
     uint64_t h_jumpDist[KANGAROO_NUM_JUMPS * 4];
     uint64_t h_jumpScalars[KANGAROO_NUM_JUMPS * 4];
     std::memset(h_jumpDist, 0, sizeof(h_jumpDist));
     std::memset(h_jumpScalars, 0, sizeof(h_jumpScalars));
 
+    /* Calculate optimal base shift for jumps. 
+       In parallel Kangaroo, mean jump should be ~ sqrt(N) / M, not sqrt(N). 
+       This prevents jumping over trails without merging. */
+    int log_threads = 0;
+    for (uint64_t v = threadsTotal; v > 1; v >>= 1) log_threads++;
+
     for (int j = 0; j < KANGAROO_NUM_JUMPS; j++) {
-        uint32_t bitPos = (uint32_t)((uint64_t)(j + 1) * (rangeBitLen / 2) / KANGAROO_NUM_JUMPS);
-        if (bitPos > 250) bitPos = 250;
-        if (bitPos == 0) bitPos = 1;
-        int limb = bitPos / 64;
-        int shift = bitPos % 64;
-        h_jumpDist[j * 4 + limb] = 1ULL << shift;
+        int optimal_sqrt_bits = (rangeBitLen / 2) - log_threads;
+        if (optimal_sqrt_bits < 4) optimal_sqrt_bits = 4;
+
+        /* Distribute jumps around the optimal mean */
+        int min_shift = optimal_sqrt_bits / 2;
+        if (min_shift < 1) min_shift = 1;
+
+        int shift = min_shift + (j * optimal_sqrt_bits) / KANGAROO_NUM_JUMPS;
+        if (shift > 250) shift = 250;
+        
+        int limb = shift / 64;
+        int rem = shift % 64;
+        h_jumpDist[j * 4 + limb] = 1ULL << rem;
         for (int k = 0; k < 4; k++)
             h_jumpScalars[j * 4 + k] = h_jumpDist[j * 4 + k];
     }
@@ -869,29 +896,40 @@ int kangaroo_main(int argc, char** argv) {
         h_startScalars.resize(threadsTotal * 4, 0);
         h_types.resize(threadsTotal, 0);
 
-        /* Midpoint: mid = range_start + range_width / 2 */
-        uint64_t half_width[4], mid[4];
-        half_width[0] = (range_width[0] >> 1) | (range_width[1] << 63);
-        half_width[1] = (range_width[1] >> 1) | (range_width[2] << 63);
-        half_width[2] = (range_width[2] >> 1) | (range_width[3] << 63);
-        half_width[3] = (range_width[3] >> 1);
-        host_add256(range_start, half_width, mid);
+        /* Generate uniform pseudo-random starting points using RNG */
+        std::mt19937_64 rng(1337); /* Fixed seed for reproducible starts, or use time() */
 
-        /* Tame: start at mid + i */
+        /* Tame: start at random points within [range_start, range_end] */
         for (uint64_t i = 0; i < numTame; i++) {
+            uint64_t rand_offset[4] = { (uint64_t)rng(), (uint64_t)rng(), (uint64_t)rng(), (uint64_t)rng() };
+
+            /* Mask down to rangeBitLen */
+            int limbs = rangeBitLen / 64;
+            int rem = rangeBitLen % 64;
+            for (int k = 3; k > limbs; k--) rand_offset[k] = 0;
+            if (rem > 0 && limbs < 4) rand_offset[limbs] &= ((1ULL << rem) - 1);
+            else if (rem == 0 && limbs < 4) rand_offset[limbs] = 0;
+
             uint64_t scalar[4];
-            host_add256_u64(mid, i, scalar);
+            host_add256(range_start, rand_offset, scalar);
             for (int k = 0; k < 4; k++)
                 h_startScalars[i * 4 + k] = scalar[k];
             h_types[i] = 0;
         }
-        /* Wild: offset from Q = i */
+
+        /* Wild: start at random offsets from Q */
         for (uint64_t i = 0; i < numWild; i++) {
+            uint64_t rand_offset[4] = { (uint64_t)rng(), (uint64_t)rng(), (uint64_t)rng(), (uint64_t)rng() };
+
+            /* Mask down to rangeBitLen */
+            int limbs = rangeBitLen / 64;
+            int rem = rangeBitLen % 64;
+            for (int k = 3; k > limbs; k--) rand_offset[k] = 0;
+            if (rem > 0 && limbs < 4) rand_offset[limbs] &= ((1ULL << rem) - 1);
+            else if (rem == 0 && limbs < 4) rand_offset[limbs] = 0;
+
             uint64_t idx = numTame + i;
-            h_startScalars[idx * 4 + 0] = i;
-            h_startScalars[idx * 4 + 1] = 0;
-            h_startScalars[idx * 4 + 2] = 0;
-            h_startScalars[idx * 4 + 3] = 0;
+            for (int k = 0; k < 4; k++) h_startScalars[idx * 4 + k] = rand_offset[k];
             h_types[idx] = 1;
         }
     }

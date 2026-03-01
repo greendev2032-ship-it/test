@@ -307,7 +307,11 @@ __global__ void kernel_kangaroo_walk(
              running *= dx[i+1]
            ======================================================== */
         /* Batched Montgomery Inversion via shared memory */
+        const uint32_t warpId = threadIdx.x >> 5;
         __shared__ uint64_t s_dx[8][32][4];
+        __shared__ uint64_t s_prefix[8][32][4];
+        __shared__ uint64_t s_inv[8][32][4];
+        uint64_t my_inv[4];
 #pragma unroll
         for (int i = 0; i < 4; i++) s_dx[warpId][lane][i] = dx[i];
         __syncwarp(full_mask);

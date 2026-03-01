@@ -903,11 +903,8 @@ int kangaroo_main(int argc, char** argv) {
     }
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
-    /* Make sure we have enough blocks to saturate the GPU.
-       A Tesla T4 has 40 SMs. 40 * 128 blocks * 256 threads = 1.3M threads.
-       This is sufficient to hide latency for the batched inversion. */
     if (numBlocks == 0)
-        numBlocks = (uint32_t)prop.multiProcessorCount * 128u;
+        numBlocks = (uint32_t)prop.multiProcessorCount * 4u;
 
     if (!resumeMode) {
         threadsTotal = (uint64_t)numBlocks * (uint64_t)threadsPerBlock;
@@ -954,16 +951,6 @@ int kangaroo_main(int argc, char** argv) {
             rangeBitLen = (uint32_t)(limb * 64 + 64 - __builtin_clzll(range_width[limb]));
             break;
         }
-    }
-
-    if (!resumeMode && dpBits == 0) {
-        /* Heuristic: dpBits ~ (rangeBitLen / 2) - 4
-           We want roughly 1 DP per thread per hour.
-           Clamp to [10, 24] to avoid memory explosion or extreme rarity. */
-        int heur = (rangeBitLen / 2) - 6;
-        if (heur < 10) heur = 10;
-        if (heur > 24) heur = 24;
-        dpBits = heur;
     }
 
     uint64_t h_jumpDist[KANGAROO_NUM_JUMPS * 4];

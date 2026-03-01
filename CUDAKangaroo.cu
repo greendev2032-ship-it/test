@@ -199,29 +199,12 @@ __device__ __forceinline__ void dist_add256(const uint64_t a[4], const uint64_t 
     asm("addc.u64    %0, %1, %2;" : "=l"(out[3]) : "l"(a[3]), "l"(b[3]));
 }
 
-__device__ __forceinline__ void dist_sub256(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
-    asm("sub.cc.u64  %0, %1, %2;" : "=l"(out[0]) : "l"(a[0]), "l"(b[0]));
-    asm("subc.cc.u64 %0, %1, %2;" : "=l"(out[1]) : "l"(a[1]), "l"(b[1]));
-    asm("subc.cc.u64 %0, %1, %2;" : "=l"(out[2]) : "l"(a[2]), "l"(b[2]));
-    asm("subc.u64    %0, %1, %2;" : "=l"(out[3]) : "l"(a[3]), "l"(b[3]));
-}
-
 /* Warp-level shuffle for 256-bit values (4 limbs) */
 __device__ __forceinline__ void shfl_256(uint64_t v[4], int srcLane, uint32_t mask) {
     v[0] = __shfl_sync(mask, v[0], srcLane);
     v[1] = __shfl_sync(mask, v[1], srcLane);
     v[2] = __shfl_sync(mask, v[2], srcLane);
     v[3] = __shfl_sync(mask, v[3], srcLane);
-}
-
-/* Negation map: if y > p/2, negate y. Returns true if negated. */
-__device__ __forceinline__ bool applyNegationMap(uint64_t y[4]) {
-    /* p/2 high limb = 0x7FFFFFFFFFFFFFFF for secp256k1 */
-    if (y[3] > 0x7FFFFFFFFFFFFFFFULL) {
-        ModNeg256(y, y);
-        return true;
-    }
-    return false;
 }
 
 /* ================================================================
@@ -233,11 +216,6 @@ __device__ __forceinline__ bool applyNegationMap(uint64_t y[4]) {
       we build a product chain of all 32 dx values, do ONE
       ModInv, then back-propagate.  Reduces inversions by 32x.
       Cost: 1 ModInv + ~93 ModMult vs 32 ModInv.
-   
-   2. Negation Map:
-      After computing (x3,y3), if y3 > p/2 we negate y3.
-      This doubles the collision space because both (x,y)
-      and (x,p-y) share the same x,  giving ~1.4x speedup.
    ================================================================ */
 
 __global__ void kernel_kangaroo_walk(
@@ -381,19 +359,6 @@ __global__ void kernel_kangaroo_walk(
         dist_add256(d, jd, nd);
 #pragma unroll
         for (int i = 0; i < 4; i++) d[i] = nd[i];
-
-        /* ========================================================
-           NEGATION MAP
-           If y > p/2, replace (x,y) with (x, p-y) and negate distance.
-           This doubles the effective collision space because both
-           a point and its negation share the same x-coordinate,
-           so DPs match regardless of y sign.  ~1.4x speedup.
-           ======================================================== */
-        if (applyNegationMap(py)) {
-            /* Negate the distance: d = -d (two's complement) */
-            uint64_t zero[4] = {0,0,0,0};
-            dist_sub256(zero, d, d);
-        }
 
         /* 3. Check for Distinguished Point */
         if (isDP(px, dpBits)) {
@@ -543,114 +508,7 @@ __global__ void kernel_decompress_pubkey(const uint64_t* inX, uint64_t* outX, ui
 }
 
 /* ================================================================
-   GLV Endomorphism: secp256k1 cube root of unity β
-
-   For secp256k1:  β³ ≡ 1 mod p,  and  λ·P = (β·Px, Py)
-   where λ³ ≡ 1 mod n (group order).
-
-   Points (x,y), (β·x,y), (β²·x,y) all lie on the curve and share
-   the same "orbit".  By canonicalizing to the smallest x in the
-   orbit, we triple the collision probability → √3 ≈ 1.73x speedup.
-   ================================================================ */
-
-/* β  = cube root of unity mod p (secp256k1 field prime) */
-static const uint64_t BETA[4] = {
-    0xC1396C28719501EEULL, 0x9CF0497512F58995ULL,
-    0x6E64479EAC3434E9ULL, 0x7AE96A2B657C0710ULL
-};
-/* β² = β·β mod p */
-static const uint64_t BETA2[4] = {
-    0x3EC693D68E6AFA40ULL, 0x630FB68AED0A766AULL,
-    0x919BB86153CBCB16ULL, 0x851695D49A83F8EFULL
-};
-/* secp256k1 field prime p */
-static const uint64_t SECP256K1_P[4] = {
-    0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
-    0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
-};
-
-/* Host-side 256-bit modular multiplication mod p */
-static void host_mod_mult_p(const uint64_t a[4], const uint64_t b[4], uint64_t r[4]) {
-    /* Schoolbook 256×256→512 bit multiplication */
-    __uint128_t prod[8] = {0};
-    for (int i = 0; i < 4; i++) {
-        __uint128_t carry = 0;
-        for (int j = 0; j < 4; j++) {
-            __uint128_t t = (__uint128_t)a[i] * b[j] + prod[i+j] + carry;
-            prod[i+j] = (uint64_t)t;
-            carry = t >> 64;
-        }
-        prod[i+4] = carry;
-    }
-    uint64_t w[8];
-    for (int i = 0; i < 8; i++) w[i] = (uint64_t)prod[i];
-
-    /* secp256k1 fast reduction: p = 2^256 - K where K = 0x1000003D1 */
-    const uint64_t K = 0x1000003D1ULL;
-    uint64_t res[5];
-    __uint128_t c = 0;
-    for (int i = 0; i < 4; i++) {
-        c += (__uint128_t)w[i] + (__uint128_t)w[i+4] * K;
-        res[i] = (uint64_t)c;
-        c >>= 64;
-    }
-    uint64_t carry_val = (uint64_t)c;
-
-    /* Second pass if carry remains */
-    if (carry_val > 0) {
-        __uint128_t c2 = (__uint128_t)res[0] + (__uint128_t)carry_val * K;
-        res[0] = (uint64_t)c2;
-        c2 >>= 64;
-        for (int i = 1; i < 4 && c2; i++) {
-            c2 += res[i];
-            res[i] = (uint64_t)c2;
-            c2 >>= 64;
-        }
-    }
-
-    /* Final: if res >= p, subtract p */
-    bool gte_p = false;
-    for (int i = 3; i >= 0; i--) {
-        if (res[i] > SECP256K1_P[i]) { gte_p = true; break; }
-        if (res[i] < SECP256K1_P[i]) break;
-    }
-    if (gte_p) {
-        uint64_t borrow = 0;
-        for (int i = 0; i < 4; i++) {
-            __uint128_t t = (__uint128_t)res[i] - SECP256K1_P[i] - borrow;
-            res[i] = (uint64_t)t;
-            borrow = (t >> 127) ? 1 : 0;
-        }
-    }
-
-    for (int i = 0; i < 4; i++) r[i] = res[i];
-}
-
-/* Compare two 256-bit LE numbers: returns -1, 0, or 1 */
-static int cmp256(const uint64_t a[4], const uint64_t b[4]) {
-    for (int i = 3; i >= 0; i--) {
-        if (a[i] < b[i]) return -1;
-        if (a[i] > b[i]) return  1;
-    }
-    return 0;
-}
-
-/* Canonicalize x: return min(x, β·x mod p, β²·x mod p) */
-static void glv_canonicalize(const uint64_t x[4], uint64_t canon[4]) {
-    uint64_t bx[4], b2x[4];
-    host_mod_mult_p(BETA,  x, bx);
-    host_mod_mult_p(BETA2, x, b2x);
-
-    /* canon = min(x, bx, b2x) */
-    const uint64_t* best = x;
-    if (cmp256(bx, best) < 0)  best = bx;
-    if (cmp256(b2x, best) < 0) best = b2x;
-
-    for (int i = 0; i < 4; i++) canon[i] = best[i];
-}
-
-/* ================================================================
-   CPU-side DP hash table with GLV equivalence class matching
+   CPU-side DP hash table for collision detection
    ================================================================ */
 
 struct DPRecord {
@@ -668,10 +526,7 @@ struct DPHash {
 class DPHashTable {
 public:
     bool insert(const DPEntry& dp, uint64_t tame_dist[4], uint64_t wild_dist[4]) {
-        /* GLV: canonicalize x to smallest in {x, β·x, β²·x} orbit */
-        uint64_t canon[4];
-        glv_canonicalize(dp.x, canon);
-        std::array<uint64_t, 4> key = {canon[0], canon[1], canon[2], canon[3]};
+        std::array<uint64_t, 4> key = {dp.x[0], dp.x[1], dp.x[2], dp.x[3]};
 
         auto it = table_.find(key);
         if (it != table_.end()) {

@@ -1102,6 +1102,10 @@ int kangaroo_main(int argc, char** argv) {
     auto tLast = t0;
     auto tLastSave = t0;
 
+    uint64_t lastJumps = 0;
+    bool found = false;
+    uint64_t solution_privkey[4] = {0};
+
     std::vector<DPEntry> hostDPBuffer(KANGAROO_DP_BUFFER_SIZE);
 
     while (!found && !g_sigint_kangaroo) {

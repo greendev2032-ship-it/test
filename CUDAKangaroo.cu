@@ -44,6 +44,7 @@
 #include <unordered_map>
 #include <array>
 #include <algorithm>
+#include <random>
 
 /* ================================================================
    We do NOT include CUDAStructures.h / CUDAMath.h here because

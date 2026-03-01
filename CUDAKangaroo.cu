@@ -212,12 +212,13 @@ __device__ __forceinline__ void shfl_256(uint64_t v[4], int srcLane, uint32_t ma
    Kangaroo walk kernel  — OPTIMIZED
    
    Optimizations:
-   1. Warp-level Batched Montgomery Inversion:
-      Instead of 32 independent ModInv per warp per step,
-      we build a product chain of all 32 dx values, do ONE
-      ModInv, then back-propagate.  Reduces inversions by 32x.
-      Cost: 1 ModInv + ~93 ModMult vs 32 ModInv.
+   1. Per-thread Batched Montgomery Inversion:
+      Following JeanLucPons/collider-main, each thread independently
+      batches KANGS_PER_THREAD jumps, avoiding warp divergence and
+      __syncwarp stalls completely while heavily utilizing registers.
    ================================================================ */
+
+#define KANGS_PER_THREAD 32
 
 __global__ void kernel_kangaroo_walk(
     uint64_t* __restrict__ g_Px,
@@ -231,158 +232,194 @@ __global__ void kernel_kangaroo_walk(
     uint32_t dpBufferCapacity,
     int* __restrict__ g_foundFlag
 ) {
-    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= threadsTotal) return;
+    const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total_kangs = threadsTotal;
+    const uint64_t num_threads = (total_kangs + KANGS_PER_THREAD - 1) / KANGS_PER_THREAD;
+    
+    if (tid >= num_threads) return;
     if (*((volatile int*)g_foundFlag) == FOUND_READY) return;
 
-    const uint32_t lane = threadIdx.x & (WARP_SIZE - 1);
-    const uint32_t full_mask = 0xFFFFFFFFu;
-
-    uint64_t px[4], py[4], d[4];
+    const uint64_t base_idx = tid * KANGS_PER_THREAD;
+    
+    uint64_t px[KANGS_PER_THREAD][4];
+    uint64_t py[KANGS_PER_THREAD][4];
+    uint64_t d[KANGS_PER_THREAD][4];
+    uint32_t kType[KANGS_PER_THREAD];
+    bool active[KANGS_PER_THREAD];
+    
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        px[i] = g_Px[gid * 4 + i];
-        py[i] = g_Py[gid * 4 + i];
-        d[i]  = g_dist[gid * 4 + i];
-    }
-    uint32_t kType = g_type[gid];
-    uint32_t dpBits = kc_dpBits;
+    for (int g = 0; g < KANGS_PER_THREAD; g++) {
+        uint64_t idx = base_idx + g;
+        if (idx < total_kangs) {
+            px[g][0] = g_Px[idx * 4 + 0]; px[g][1] = g_Px[idx * 4 + 1];
+            px[g][2] = g_Px[idx * 4 + 2]; px[g][3] = g_Px[idx * 4 + 3];
 
+            py[g][0] = g_Py[idx * 4 + 0]; py[g][1] = g_Py[idx * 4 + 1];
+            py[g][2] = g_Py[idx * 4 + 2]; py[g][3] = g_Py[idx * 4 + 3];
+
+            d[g][0]  = g_dist[idx * 4 + 0]; d[g][1]  = g_dist[idx * 4 + 1];
+            d[g][2]  = g_dist[idx * 4 + 2]; d[g][3]  = g_dist[idx * 4 + 3];
+
+            kType[g] = g_type[idx];
+            active[g] = true;
+        } else {
+            active[g] = false;
+        }
+    }
+    
+    uint32_t dpBits = kc_dpBits;
+    
     for (uint32_t step = 0; step < stepsPerLaunch; step++) {
         /* Warp-level early exit every 64 steps */
         if ((step & 63) == 0) {
-            int f = 0;
-            if (lane == 0) f = *((volatile int*)g_foundFlag);
-            f = __shfl_sync(full_mask, f, 0);
+            int f = *((volatile int*)g_foundFlag);
             if (f == FOUND_READY) break;
         }
 
-        /* 1. Pick jump */
-        uint32_t jIdx = jumpIndex(px);
-        uint64_t jx[4], jy[4], jd[4];
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            jx[i] = kc_jumpX[jIdx * 4 + i];
-            jy[i] = kc_jumpY[jIdx * 4 + i];
-            jd[i] = kc_jumpDist[jIdx * 4 + i];
+        uint32_t jump_idx[KANGS_PER_THREAD];
+        uint64_t dx[KANGS_PER_THREAD][4];
+        
+        for (int g = 0; g < KANGS_PER_THREAD; g++) {
+            if (!active[g]) continue;
+            
+            jump_idx[g] = jumpIndex(px[g]);
+            uint64_t jx[4];
+            jx[0] = kc_jumpX[jump_idx[g] * 4 + 0]; jx[1] = kc_jumpX[jump_idx[g] * 4 + 1];
+            jx[2] = kc_jumpX[jump_idx[g] * 4 + 2]; jx[3] = kc_jumpX[jump_idx[g] * 4 + 3];
+            
+            ModSub256(dx[g], jx, px[g]);
         }
+        
+        /* Batch Inversion per thread */
+        uint64_t products[KANGS_PER_THREAD][4];
+        int first_active = -1;
+        uint64_t prev_prod[4];
+        
+        for (int g = 0; g < KANGS_PER_THREAD; g++) {
+            if (!active[g]) continue;
+            if (first_active == -1) {
+                first_active = g;
+                products[g][0] = dx[g][0]; products[g][1] = dx[g][1];
+                products[g][2] = dx[g][2]; products[g][3] = dx[g][3];
 
-        /* 2. Compute dx = jx - px */
-        uint64_t dx[4];
-        ModSub256(dx, jx, px);
-
-        /* ========================================================
-           BATCHED MONTGOMERY INVERSION (Shared Memory)
-
-           Classic Montgomery trick using shared memory within each
-           warp.  32 inversions become 1 inversion + 93 multiplications.
-
-           prefix[i] = dx[0] * dx[1] * ... * dx[i]
-           Invert prefix[31] = product of all dx
-           Back-propagate:
-             inv[31] = prefix[30] * total_inv
-             inv[i]  = prefix[i-1] * running_right_product
-             running *= dx[i+1]
-           ======================================================== */
-        /* Batched Montgomery Inversion via shared memory */
-        const uint32_t warpId = threadIdx.x >> 5;
-        __shared__ uint64_t s_dx[8][32][4];
-        __shared__ uint64_t s_prefix[8][32][4];
-        __shared__ uint64_t s_inv[8][32][4];
-        uint64_t my_inv[4];
-#pragma unroll
-        for (int i = 0; i < 4; i++) s_dx[warpId][lane][i] = dx[i];
-        __syncwarp(full_mask);
-
-        /* Redo prefix product using s_dx */
-        if (lane == 0) {
-            /* Rebuild prefix */
-            for (int i = 0; i < 4; i++) s_prefix[warpId][0][i] = s_dx[warpId][0][i];
-            for (int l = 1; l < WARP_SIZE; l++) {
-                uint64_t res[4];
-                _ModMult(res, (uint64_t*)s_prefix[warpId][l-1], (uint64_t*)s_dx[warpId][l]);
-                for (int i = 0; i < 4; i++) s_prefix[warpId][l][i] = res[i];
-            }
-
-            /* Invert total product */
-            uint64_t inv5[5];
-            for (int i = 0; i < 4; i++) inv5[i] = s_prefix[warpId][WARP_SIZE-1][i];
-            inv5[4] = 0;
-            _ModInv(inv5);
-
-            /* Back-propagate */
-            uint64_t right[4];
-            for (int i = 0; i < 4; i++) right[i] = inv5[i];
-
-            for (int l = WARP_SIZE - 1; l >= 0; l--) {
-                if (l == 0) {
-                    for (int i = 0; i < 4; i++) s_inv[warpId][l][i] = right[i];
-                } else {
-                    uint64_t res[4];
-                    _ModMult(res, (uint64_t*)s_prefix[warpId][l-1], right);
-                    for (int i = 0; i < 4; i++) s_inv[warpId][l][i] = res[i];
-                }
-                /* right *= dx[l] */
-                uint64_t new_right[4];
-                _ModMult(new_right, right, (uint64_t*)s_dx[warpId][l]);
-                for (int i = 0; i < 4; i++) right[i] = new_right[i];
+                prev_prod[0] = dx[g][0]; prev_prod[1] = dx[g][1];
+                prev_prod[2] = dx[g][2]; prev_prod[3] = dx[g][3];
+            } else {
+                _ModMult((uint64_t*)products[g], prev_prod, (uint64_t*)dx[g]);
+                prev_prod[0] = products[g][0]; prev_prod[1] = products[g][1];
+                prev_prod[2] = products[g][2]; prev_prod[3] = products[g][3];
             }
         }
-        __syncwarp(full_mask);
+        
+        if (first_active == -1) break;
+        
+        int last_active = -1;
+        for (int g = KANGS_PER_THREAD - 1; g >= 0; g--) {
+            if (active[g]) { last_active = g; break; }
+        }
+        
+        uint64_t inv5[5];
+        inv5[0] = products[last_active][0]; inv5[1] = products[last_active][1];
+        inv5[2] = products[last_active][2]; inv5[3] = products[last_active][3];
+        inv5[4] = 0;
+        _ModInv(inv5);
+        
+        uint64_t right[4];
+        right[0] = inv5[0]; right[1] = inv5[1];
+        right[2] = inv5[2]; right[3] = inv5[3];
+        
+        for (int g = last_active; g > first_active; g--) {
+            if (!active[g]) continue;
+            
+            int prev_g = g - 1;
+            while (prev_g >= 0 && !active[prev_g]) prev_g--;
+            
+            uint64_t new_inv[4];
+            _ModMult(new_inv, right, (uint64_t*)products[prev_g]);
+            
+            uint64_t new_right[4];
+            _ModMult(new_right, right, (uint64_t*)dx[g]);
+            
+            dx[g][0] = new_inv[0]; dx[g][1] = new_inv[1];
+            dx[g][2] = new_inv[2]; dx[g][3] = new_inv[3];
+            
+            right[0] = new_right[0]; right[1] = new_right[1];
+            right[2] = new_right[2]; right[3] = new_right[3];
+        }
+        dx[first_active][0] = right[0]; dx[first_active][1] = right[1];
+        dx[first_active][2] = right[2]; dx[first_active][3] = right[3];
+        
+        /* Apply inverted denominators */
+        for (int g = 0; g < KANGS_PER_THREAD; g++) {
+            if (!active[g]) continue;
+            
+            int jIdx = jump_idx[g];
+            uint64_t jx[4], jy[4], jd[4];
+            jx[0] = kc_jumpX[jIdx * 4 + 0]; jx[1] = kc_jumpX[jIdx * 4 + 1];
+            jx[2] = kc_jumpX[jIdx * 4 + 2]; jx[3] = kc_jumpX[jIdx * 4 + 3];
 
-        /* Each lane reads its individual inverse */
-#pragma unroll
-        for (int i = 0; i < 4; i++) my_inv[i] = s_inv[warpId][lane][i];
+            jy[0] = kc_jumpY[jIdx * 4 + 0]; jy[1] = kc_jumpY[jIdx * 4 + 1];
+            jy[2] = kc_jumpY[jIdx * 4 + 2]; jy[3] = kc_jumpY[jIdx * 4 + 3];
 
-        /* lambda = (jy - py) * inv(jx - px) */
-        uint64_t dy_ec[4], lam[4];
-        ModSub256(dy_ec, jy, py);
-        _ModMult(lam, dy_ec, my_inv);
+            jd[0] = kc_jumpDist[jIdx * 4 + 0]; jd[1] = kc_jumpDist[jIdx * 4 + 1];
+            jd[2] = kc_jumpDist[jIdx * 4 + 2]; jd[3] = kc_jumpDist[jIdx * 4 + 3];
+            
+            uint64_t dy_ec[4], lam[4];
+            ModSub256(dy_ec, jy, py[g]);
+            _ModMult(lam, dy_ec, dx[g]);
+            
+            uint64_t x3[4];
+            _ModSqr(x3, lam);
+            ModSub256(x3, x3, px[g]);
+            ModSub256(x3, x3, jx);
+            
+            uint64_t tmp[4], y3[4];
+            ModSub256(tmp, px[g], x3);
+            _ModMult(y3, lam, tmp);
+            ModSub256(y3, y3, py[g]);
+            
+            px[g][0] = x3[0]; px[g][1] = x3[1];
+            px[g][2] = x3[2]; px[g][3] = x3[3];
 
-        /* x3 = lam^2 - px - jx */
-        uint64_t x3[4];
-        _ModSqr(x3, lam);
-        ModSub256(x3, x3, px);
-        ModSub256(x3, x3, jx);
+            py[g][0] = y3[0]; py[g][1] = y3[1];
+            py[g][2] = y3[2]; py[g][3] = y3[3];
+            
+            uint64_t new_d[4];
+            dist_add256(d[g], jd, new_d);
+            d[g][0] = new_d[0]; d[g][1] = new_d[1];
+            d[g][2] = new_d[2]; d[g][3] = new_d[3];
+            
+            /* DP Check */
+            if (isDP(px[g], dpBits)) {
+                uint32_t slot = atomicAdd(g_dpCount, 1u);
+                if (slot < dpBufferCapacity) {
+                    DPEntry* e = &g_dpBuffer[slot];
+                    e->x[0] = px[g][0]; e->x[1] = px[g][1];
+                    e->x[2] = px[g][2]; e->x[3] = px[g][3];
 
-        /* y3 = lam * (px - x3) - py */
-        uint64_t tmp[4], y3[4];
-        ModSub256(tmp, px, x3);
-        _ModMult(y3, lam, tmp);
-        ModSub256(y3, y3, py);
+                    e->dist[0] = d[g][0]; e->dist[1] = d[g][1];
+                    e->dist[2] = d[g][2]; e->dist[3] = d[g][3];
 
-        /* Update point */
-#pragma unroll
-        for (int i = 0; i < 4; i++) { px[i] = x3[i]; py[i] = y3[i]; }
-
-        /* Update distance: d += jd */
-        uint64_t nd[4];
-        dist_add256(d, jd, nd);
-#pragma unroll
-        for (int i = 0; i < 4; i++) d[i] = nd[i];
-
-        /* 3. Check for Distinguished Point */
-        if (isDP(px, dpBits)) {
-            uint32_t slot = atomicAdd(g_dpCount, 1u);
-            if (slot < dpBufferCapacity) {
-                DPEntry* e = &g_dpBuffer[slot];
-#pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    e->x[i]    = px[i];
-                    e->dist[i] = d[i];
+                    e->type = kType[g];
+                    e->kangarooId = (uint32_t)(base_idx + g);
                 }
-                e->type = kType;
-                e->kangarooId = (uint32_t)gid;
             }
         }
     }
-
+    
     /* Write state back */
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        g_Px[gid * 4 + i]   = px[i];
-        g_Py[gid * 4 + i]   = py[i];
-        g_dist[gid * 4 + i] = d[i];
+    for (int g = 0; g < KANGS_PER_THREAD; g++) {
+        if (!active[g]) continue;
+        uint64_t idx = base_idx + g;
+        g_Px[idx * 4 + 0] = px[g][0]; g_Px[idx * 4 + 1] = px[g][1];
+        g_Px[idx * 4 + 2] = px[g][2]; g_Px[idx * 4 + 3] = px[g][3];
+
+        g_Py[idx * 4 + 0] = py[g][0]; g_Py[idx * 4 + 1] = py[g][1];
+        g_Py[idx * 4 + 2] = py[g][2]; g_Py[idx * 4 + 3] = py[g][3];
+
+        g_dist[idx * 4 + 0] = d[g][0]; g_dist[idx * 4 + 1] = d[g][1];
+        g_dist[idx * 4 + 2] = d[g][2]; g_dist[idx * 4 + 3] = d[g][3];
     }
 }
 
@@ -764,7 +801,7 @@ int kangaroo_main(int argc, char** argv) {
         numBlocks = (uint32_t)prop.multiProcessorCount * 128u;
 
     if (!resumeMode) {
-        threadsTotal = (uint64_t)numBlocks * (uint64_t)threadsPerBlock;
+        threadsTotal = (uint64_t)numBlocks * (uint64_t)threadsPerBlock * 32ULL;
     } else {
         /* On resume, use the block/thread count from the save file */
         numBlocks = (uint32_t)(threadsTotal / threadsPerBlock);

@@ -746,23 +746,27 @@ static bool loadState(const char* path,
     uint32_t& dpBits) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
-    (void)fread(&magic, 4, 1, f);
+    uint32_t magic = 0;
+    if (fread(&magic, 4, 1, f) != 1) { fclose(f); return false; }
     if (magic != 0x4B414E47) { fclose(f); return false; }
-    (void)fread(&threadsTotal, 8, 1, f);
-    (void)fread(&totalJumps, 8, 1, f);
-    (void)fread(&dpBits, 4, 1, f);
-    (void)fread(targetX, 8, 4, f);
-    (void)fread(targetY, 8, 4, f);
-    (void)fread(range_start, 8, 4, f);
-    (void)fread(range_end, 8, 4, f);
+    if (fread(&threadsTotal, 8, 1, f) != 1) { fclose(f); return false; }
+    if (fread(&totalJumps, 8, 1, f) != 1) { fclose(f); return false; }
+    if (fread(&dpBits, 4, 1, f) != 1) { fclose(f); return false; }
+    if (fread(targetX, 8, 4, f) != 4) { fclose(f); return false; }
+    if (fread(targetY, 8, 4, f) != 4) { fclose(f); return false; }
+    if (fread(range_start, 8, 4, f) != 4) { fclose(f); return false; }
+    if (fread(range_end, 8, 4, f) != 4) { fclose(f); return false; }
+    
     h_Px.resize(threadsTotal * 4);
     h_Py.resize(threadsTotal * 4);
     h_dist.resize(threadsTotal * 4);
     h_types.resize(threadsTotal);
-    (void)fread(h_Px.data(),    8, threadsTotal * 4, f);
-    (void)fread(h_Py.data(),    8, threadsTotal * 4, f);
-    (void)fread(h_dist.data(),  8, threadsTotal * 4, f);
-    (void)fread(h_types.data(), 4, threadsTotal, f);
+    
+    if (fread(h_Px.data(),    8, threadsTotal * 4, f) != threadsTotal * 4) { fclose(f); return false; }
+    if (fread(h_Py.data(),    8, threadsTotal * 4, f) != threadsTotal * 4) { fclose(f); return false; }
+    if (fread(h_dist.data(),  8, threadsTotal * 4, f) != threadsTotal * 4) { fclose(f); return false; }
+    if (fread(h_types.data(), 4, threadsTotal, f) != threadsTotal) { fclose(f); return false; }
+    
     fclose(f);
     return true;
 }

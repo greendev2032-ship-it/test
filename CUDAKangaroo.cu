@@ -9,9 +9,11 @@
 
 #include "CUDAKangaroo.cuh"
 
+#include "CUDAUtils.h"
+
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern std::string formatHex256(const uint64_t limbs[4]);
-extern long double ld_from_u256(const uint64_t v[4]);
+extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 extern __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 

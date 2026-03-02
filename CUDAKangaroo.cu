@@ -169,6 +169,9 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     long double W_ld  = ld_from_u256(W);
     long double Wsqrt = ::sqrtl(W_ld);
 
+    int pow2W    = (int)std::round(std::log2l(W_ld));
+    int pow2Jmax = getPow2Jmax(Wsqrt / 2.0L);
+
     uint64_t halfW[4]; for(int i=0;i<4;i++) halfW[i]=W[i];
     host_shr1_256(halfW);
     uint64_t M[4]; host_add256(M, range_start, halfW);
@@ -247,7 +250,6 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
         return 1;
     }
 
-    unsigned int MAX_DPS = 200000;
     DPRecord* d_dp_buffer;
     unsigned int* d_dp_count;
     cudaMalloc(&d_dp_buffer, MAX_DPS * sizeof(DPRecord));
@@ -255,7 +257,7 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
 
     // ── build jump point table c_SpX / c_SpY ─────────────────────────
     {
-        size_t jpCount = (size_t)std::min(pow2Jmax, (int)MAX_JUMP_POINTS);
+        size_t jpCount = (size_t)std::min((size_t)pow2Jmax, (size_t)MAX_JUMP_POINTS);
         std::vector<uint64_t> h_scalars(jpCount * 4, 0);
         for (size_t k = 0; k < jpCount; ++k) {
             // 2^k as uint256 little-endian

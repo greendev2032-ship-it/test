@@ -283,9 +283,14 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
         std::vector<uint64_t> h_dist(TOTAL_KANGAROOS * 4, 0);
         std::vector<uint32_t> h_types(TOTAL_KANGAROOS);
 
-        int wsqrt_bits = pow2W / 2;
-        uint64_t rand_mask0 = (wsqrt_bits < 64) ? ((1ULL << wsqrt_bits) - 1) : 0xFFFFFFFFFFFFFFFFULL;
-        uint64_t rand_mask1 = (wsqrt_bits < 64)  ? 0 : (wsqrt_bits < 128 ? ((1ULL << (wsqrt_bits-64)) - 1) : 0xFFFFFFFFFFFFFFFFULL);
+        // Generate random 256-bit offsets up to W (which is max 128-bit usually for this problem size).
+        // For general ranges, W could be 256-bit, but typically pow2W < 128 in these puzzles.
+        int w_bits = pow2W;
+        if (w_bits > 128) w_bits = 128; // fallback limit for naive randomizer
+
+        // We want offsets uniform in [0, W). We'll approximate by generating random bits up to w_bits.
+        uint64_t rand_mask0 = (w_bits >= 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << w_bits) - 1);
+        uint64_t rand_mask1 = (w_bits <= 64) ? 0 : (w_bits >= 128 ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << (w_bits - 64)) - 1));
 
         // Tame: start at M + randT,  dist = randT
         for (uint32_t k = 0; k < half; ++k) {
@@ -387,20 +392,21 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
         if (since > 1.0 || found) {
             t_last = now;
             double jps = total_jumps / elapsed;
-            double progress = (total_jumps / ((double)TOTAL_KANGAROOS)) / (2.0 * Wsqrt) * 100.0;
+            // Expected total jumps needed is roughly ~ 2 * sqrt(W)
+            // Progress = total_jumps / (2 * sqrt(W))
+            double progress = ((double)total_jumps / (2.0 * (double)Wsqrt)) * 100.0;
             std::cout << "\r[" << std::fixed << std::setprecision(0) << elapsed << "s] "
                       << std::fixed << std::setprecision(1) << jps/1e6 << " Mj/s | "
-                      << "DPs=" << dp_map.size()
-                      << " | Est: " << std::setprecision(1) << progress << "% "
-                      << " | Restarts=" << restart_count
+                      << "DPs: " << dp_map.size()
+                      << " | Est: " << std::setprecision(2) << progress << "% "
+                      << " | Res: " << restart_count
                       << "    " << std::flush;
         }
 
-        // ── auto-restart if no solution after ~4*sqrt(W) jumps per kangaroo ─────────
-        // Expected collision at ~2*sqrt(W) total jumps (across all kangaroos)
-        // We restart when each kangaroo has jumped ~4*sqrt(W) steps with no success
-        uint64_t restart_threshold = (uint64_t)(4.0L * Wsqrt) * slices;
-        if (!found && (total_jumps / TOTAL_KANGAROOS) > restart_threshold) {
+        // ── auto-restart if no solution after expected time ─────────
+        // Restart if we exceed 4 * sqrt(W) total jumps across ALL kangaroos combined
+        double expected_jumps_limit = 4.0 * Wsqrt;
+        if (!found && (double)total_jumps > expected_jumps_limit) {
             do_restart();
             total_jumps = 0;
             t0 = std::chrono::high_resolution_clock::now();

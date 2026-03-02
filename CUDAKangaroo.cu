@@ -197,18 +197,11 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     cudaMemGetInfo(&free_mem, &total_mem);
     size_t usable = (size_t)(free_mem * 0.70);
     const size_t per_k = (4+4+4)*sizeof(uint64_t) + sizeof(uint32_t); // 100 bytes
-    uint32_t MAX_KANGAROOS_VRAM = (uint32_t)(usable / per_k);
+    uint32_t TOTAL_KANGAROOS = (uint32_t)(usable / per_k);
 
-    // If range is small, using too many kangaroos is inefficient because
-    // the DP tracks become too short or the buffer overflows.
-    // Rule of thumb: We want each kangaroo to do at least 256 jumps.
-    // Expected total jumps = 2 * Wsqrt. So optimal kangaroos = (2 * Wsqrt) / 256.
-    uint32_t optimal_kangaroos = (uint32_t)std::min((long double)MAX_KANGAROOS_VRAM, (2.0L * Wsqrt) / 64.0L);
-    
     // Round down to multiple of 512
-    uint32_t TOTAL_KANGAROOS = (optimal_kangaroos / 512) * 512;
+    TOTAL_KANGAROOS = (TOTAL_KANGAROOS / 512) * 512;
     if (TOTAL_KANGAROOS < 512) TOTAL_KANGAROOS = 512;
-    if (TOTAL_KANGAROOS > MAX_KANGAROOS_VRAM) TOTAL_KANGAROOS = (MAX_KANGAROOS_VRAM / 512) * 512;
 
     const uint32_t KANGAROOS_PER_THREAD = 8;
     if (TOTAL_KANGAROOS % KANGAROOS_PER_THREAD != 0) TOTAL_KANGAROOS -= TOTAL_KANGAROOS % KANGAROOS_PER_THREAD;
@@ -219,15 +212,17 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
 
     // ── Calculate Distingished Point Mask ───────────────────────────
     unsigned int MAX_DPS = 200000;
-    // We expect ~ 4*Wsqrt total jumps. We want to generate ~ MAX_DPS/2 DPs in total.
-    long double expected_jumps = 4.0L * Wsqrt;
-    long double optimal_dp_mod = expected_jumps / (MAX_DPS * 0.5L);
-    int pow2dp = 0;
-    if (optimal_dp_mod > 1.0L) {
-        pow2dp = (int)std::round(std::log2l(optimal_dp_mod));
-    }
-    // Don't let pow2dp exceed the maximum safe DP distance
-    // We don't want kangaroo trails to take hours. Max trail = 2^20.
+    // To prevent the CPU hashmap from exploding and causing OOM freezes,
+    // we need to strictly control the DP generation rate.
+    // If the GPU does ~2 Billion jumps/s, and we want max 50,000 DPs/s,
+    // dp_mask should be 2B / 50k = 40,000 -> ~2^15.
+    int pow2dp = 12; // safe default
+    long double expected_jumps_total = 4.0L * Wsqrt;
+    long double optimal_dp_mod = expected_jumps_total / (MAX_DPS * 0.5L);
+    
+    if (TOTAL_KANGAROOS > 1000000) pow2dp = 15; // force high mask for big K
+    else if (optimal_dp_mod > 1.0L) pow2dp = (int)std::round(std::log2l(optimal_dp_mod));
+
     if (pow2dp > 20) pow2dp = 20;
     if (pow2dp < 0) pow2dp = 0;
     uint32_t dp_mask = (uint32_t)((1ULL << pow2dp) - 1);
@@ -287,9 +282,11 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
 
     uint64_t target_privatekey[4]{};
     bool found = false;
+    uint32_t restart_count = 0;
 
     // Fast GPU initialization kernel instead of slow CPU loop
     auto do_init = [&]() {
+        restart_count++;
         uint32_t half = TOTAL_KANGAROOS / 2;
         int w_bits = pow2W;
         if (w_bits > 128) w_bits = 128;
@@ -360,8 +357,16 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     std::cout << "[+] Running Kangaroos...\n";
     int blocks = (threadsTotal + 255) / 256;
     uint64_t total_jumps = 0;
+    uint64_t session_jumps = 0;
     auto t0 = std::chrono::high_resolution_clock::now();
     auto t_last = t0;
+
+    // Calculate restart threshold (jumps PER kangaroo).
+    // Ensure they jump at least 4 * dp_mask to allow trails to hit a DP.
+    double req_jumps_per_K = (4.0 * Wsqrt) / (double)TOTAL_KANGAROOS;
+    double min_jumps_for_dp = 4.0 * (1ULL << pow2dp);
+    double restart_threshold_per_K = std::max(req_jumps_per_K, min_jumps_for_dp);
+    uint64_t session_jumps_limit = (uint64_t)(restart_threshold_per_K * TOTAL_KANGAROOS);
 
     while (!found) {
         kernel_kangaroo_jump<<<blocks, 256>>>(
@@ -370,7 +375,9 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
             (uint32_t)pow2Jmax, dp_mask,
             d_dp_buffer, d_dp_count, MAX_DPS);
         cudaDeviceSynchronize();
-        total_jumps += (uint64_t)TOTAL_KANGAROOS * slices;
+        uint64_t batch_jumps = (uint64_t)TOTAL_KANGAROOS * slices;
+        total_jumps += batch_jumps;
+        session_jumps += batch_jumps;
 
         // ── harvest DPs ─────────────────
         unsigned int dps = 0;
@@ -413,14 +420,19 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
         if (since > 1.0 || found) {
             t_last = now;
             double jps = total_jumps / elapsed;
-            // Expected total jumps needed is roughly ~ 2 * sqrt(W)
-            // Progress = total_jumps / (2 * sqrt(W))
-            double progress = ((double)total_jumps / (2.0 * (double)Wsqrt)) * 100.0;
+            double progress = ((double)session_jumps / (double)session_jumps_limit) * 100.0;
             std::cout << "\r[" << std::fixed << std::setprecision(0) << elapsed << "s] "
                       << std::fixed << std::setprecision(1) << jps/1e6 << " Mj/s | "
                       << "DPs: " << dp_map.size()
-                      << " | Est: " << std::setprecision(2) << progress << "%   "
+                      << " | Est: " << std::setprecision(2) << progress << "% "
+                      << " | Res: " << (restart_count - 1)
                       << "    " << std::flush;
+        }
+
+        // Restart loop to prevent DP map from ballooning infinitely and to reset dead kangaroos
+        if (!found && session_jumps >= session_jumps_limit) {
+            do_init();
+            session_jumps = 0;
         }
     }
 

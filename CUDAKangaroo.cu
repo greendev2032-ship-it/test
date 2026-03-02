@@ -169,18 +169,12 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     long double W_ld  = ld_from_u256(W);
     long double Wsqrt = ::sqrtl(W_ld);
 
-    int pow2W    = (int)std::round(std::log2l(W_ld));
-    int pow2Jmax = getPow2Jmax(Wsqrt / 2.0L);
-    int pow2dp   = std::max(0, (pow2W / 2) - 2);
-    uint32_t dp_mask = (uint32_t)((1ULL << pow2dp) - 1);
-
     uint64_t halfW[4]; for(int i=0;i<4;i++) halfW[i]=W[i];
     host_shr1_256(halfW);
     uint64_t M[4]; host_add256(M, range_start, halfW);
 
     std::cout << "[+] W  = 2^" << pow2W  << "\n";
     std::cout << "[+] Jmax = 2^" << pow2Jmax << "\n";
-    std::cout << "[+] dp_mask = 2^" << pow2dp << "\n";
     std::cout << "[+] M = " << formatHex256(M) << "\n";
 
     // ── parse pubkey ───────────────────────────────────────────────
@@ -195,24 +189,47 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
         }
     }
 
-    // ── determine how many kangaroos fit in VRAM ────────────────────
+    // ── determine how many kangaroos fit / are needed ────────────────
     size_t free_mem=0, total_mem=0;
     cudaMemGetInfo(&free_mem, &total_mem);
-    // Each kangaroo consumes: X(32)+Y(32)+dist(32)+type(4) = 100 bytes
-    // Use 70% of VRAM to leave headroom for initialization (scalarMul uses d_Kdist as temp)
     size_t usable = (size_t)(free_mem * 0.70);
     const size_t per_k = (4+4+4)*sizeof(uint64_t) + sizeof(uint32_t); // 100 bytes
-    uint32_t TOTAL_KANGAROOS = (uint32_t)(usable / per_k);
-    // Round down to multiple of 512 (must be divisible by 2 and threads)
-    TOTAL_KANGAROOS = (TOTAL_KANGAROOS / 512) * 512;
-    if (TOTAL_KANGAROOS < 512) { TOTAL_KANGAROOS = 512; }
+    uint32_t MAX_KANGAROOS_VRAM = (uint32_t)(usable / per_k);
+
+    // If range is small, using too many kangaroos is inefficient because
+    // the DP tracks become too short or the buffer overflows.
+    // Rule of thumb: We want each kangaroo to do at least 256 jumps.
+    // Expected total jumps = 2 * Wsqrt. So optimal kangaroos = (2 * Wsqrt) / 256.
+    uint32_t optimal_kangaroos = (uint32_t)std::min((long double)MAX_KANGAROOS_VRAM, (2.0L * Wsqrt) / 64.0L);
+    
+    // Round down to multiple of 512
+    uint32_t TOTAL_KANGAROOS = (optimal_kangaroos / 512) * 512;
+    if (TOTAL_KANGAROOS < 512) TOTAL_KANGAROOS = 512;
+    if (TOTAL_KANGAROOS > MAX_KANGAROOS_VRAM) TOTAL_KANGAROOS = (MAX_KANGAROOS_VRAM / 512) * 512;
+
     const uint32_t KANGAROOS_PER_THREAD = 8;
     if (TOTAL_KANGAROOS % KANGAROOS_PER_THREAD != 0) TOTAL_KANGAROOS -= TOTAL_KANGAROOS % KANGAROOS_PER_THREAD;
     uint32_t threadsTotal = TOTAL_KANGAROOS / KANGAROOS_PER_THREAD;
 
     std::cout << "[+] VRAM free     = " << (free_mem/1024/1024) << " MB\n";
     std::cout << "[+] Kangaroos     = " << TOTAL_KANGAROOS << "  (threads=" << threadsTotal << ")\n";
-    std::cout << "[+] Each kangaroo = " << per_k << " bytes | Total = " << (per_k*(size_t)TOTAL_KANGAROOS/1024/1024) << " MB\n";
+
+    // ── Calculate Distingished Point Mask ───────────────────────────
+    unsigned int MAX_DPS = 200000;
+    // We expect ~ 4*Wsqrt total jumps. We want to generate ~ MAX_DPS/2 DPs in total.
+    long double expected_jumps = 4.0L * Wsqrt;
+    long double optimal_dp_mod = expected_jumps / (MAX_DPS * 0.5L);
+    int pow2dp = 0;
+    if (optimal_dp_mod > 1.0L) {
+        pow2dp = (int)std::round(std::log2l(optimal_dp_mod));
+    }
+    // Don't let pow2dp exceed the maximum safe DP distance
+    // We don't want kangaroo trails to take hours. Max trail = 2^20.
+    if (pow2dp > 20) pow2dp = 20;
+    if (pow2dp < 0) pow2dp = 0;
+    uint32_t dp_mask = (uint32_t)((1ULL << pow2dp) - 1);
+
+    std::cout << "[+] dp_mask = 2^" << pow2dp << " (1 DP per " << (1ULL<<pow2dp) << " jumps)\n";
 
     // ── allocate GPU buffers ─────────────────────────────────────────
     uint64_t *d_Kx, *d_Ky, *d_Kdist;

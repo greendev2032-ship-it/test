@@ -1219,15 +1219,6 @@ __device__ __forceinline__ void scalarMulBaseAffine(const uint64_t* scalar_le, u
     }
 }
 
-__global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
 
-    const uint64_t* scalar = scalars_in + idx*4;
-    uint64_t* outx = outX + idx*4;
-    uint64_t* outy = outY + idx*4;
-
-    scalarMulBaseAffine(scalar, outx, outy);
-}
 
 

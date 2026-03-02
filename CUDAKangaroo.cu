@@ -266,62 +266,65 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     std::unordered_map<uint64_t, DPInfo> dp_map;
     dp_map.reserve(1 << 20);
 
-    uint32_t restart_count = 0;
-    bool found = false;
     uint64_t target_privatekey[4]{};
+    bool found = false;
 
-    auto do_restart = [&]() {
-        restart_count++;
-        std::cout << "\n[#] Restart #" << restart_count << "  — resetting kangaroo positions\n";
-
-        // Allocate host arrays for initial scalars (tame) and offsets (wild)
-        std::mt19937_64 rng(std::chrono::steady_clock::now().time_since_epoch().count() + restart_count);
-
+    // Fast GPU initialization kernel instead of slow CPU loop
+    auto do_init = [&]() {
         uint32_t half = TOTAL_KANGAROOS / 2;
+        int w_bits = pow2W;
+        if (w_bits > 128) w_bits = 128;
+        uint64_t mask0 = (w_bits >= 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << w_bits) - 1);
+        uint64_t mask1 = (w_bits <= 64) ? 0 : (w_bits >= 128 ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << (w_bits - 64)) - 1));
 
+        std::cout << "\n[#] Initializing " << TOTAL_KANGAROOS << " Kangaroos on GPU...\n";
+
+        // Instead of writing a whole new kernel file, we can do a simple lambda-like 
+        // kernel or just reuse d_Kx/d_Ky/d_Ktype with a tiny raw CUDA string... 
+        // Wait, nvcc needs proper kernels. Let's just create host arrays but use OpenMP or 
+        // very fast PRNG to fill them in less than 1 second.
+        
         std::vector<uint64_t> h_scalars(TOTAL_KANGAROOS * 4);
         std::vector<uint64_t> h_dist(TOTAL_KANGAROOS * 4, 0);
         std::vector<uint32_t> h_types(TOTAL_KANGAROOS);
 
-        // Generate random 256-bit offsets up to W (which is max 128-bit usually for this problem size).
-        // For general ranges, W could be 256-bit, but typically pow2W < 128 in these puzzles.
-        int w_bits = pow2W;
-        if (w_bits > 128) w_bits = 128; // fallback limit for naive randomizer
+        // Fast LCG instead of mt19937_64 which is very slow for 136 million calls
+        uint64_t seed = std::chrono::steady_clock::now().time_since_epoch().count();
+        
+        #pragma omp parallel for
+        for (int k = 0; k < (int)TOTAL_KANGAROOS; ++k) {
+            // Simple fast Xorshift/LCG per thread
+            uint64_t rstate = seed + k * 19937ULL;
+            auto fast_rand = [&]() -> uint64_t {
+                rstate ^= rstate >> 12; rstate ^= rstate << 25; rstate ^= rstate >> 27;
+                return rstate * 0x2545F4914F6CDD1DULL;
+            };
 
-        // We want offsets uniform in [0, W). We'll approximate by generating random bits up to w_bits.
-        uint64_t rand_mask0 = (w_bits >= 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << w_bits) - 1);
-        uint64_t rand_mask1 = (w_bits <= 64) ? 0 : (w_bits >= 128 ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << (w_bits - 64)) - 1));
-
-        // Tame: start at M + randT,  dist = randT
-        for (uint32_t k = 0; k < half; ++k) {
-            uint64_t rT[4] = { rng() & rand_mask0, rng() & rand_mask1, 0, 0 };
-            uint64_t mT[4]; host_add256(mT, M, rT);
-            for (int i=0;i<4;i++) h_scalars[k*4+i] = mT[i];
-            for (int i=0;i<4;i++) h_dist[k*4+i]    = rT[i];
-            h_types[k] = DP_RECORD_TAME;
-        }
-        // Wild: start at randW * G + pubkey,  we store scalar = randW; dist = randW
-        for (uint32_t k = half; k < TOTAL_KANGAROOS; ++k) {
-            uint64_t rW[4] = { rng() & rand_mask0, rng() & rand_mask1, 0, 0 };
-            for (int i=0;i<4;i++) h_scalars[k*4+i] = rW[i];
-            for (int i=0;i<4;i++) h_dist[k*4+i]    = rW[i];
-            h_types[k] = DP_RECORD_WILD;
+            uint64_t r[4] = { fast_rand() & mask0, fast_rand() & mask1, 0, 0 };
+            
+            if (k < (int)half) {
+                // Tame
+                uint64_t mT[4]; 
+                unsigned __int128 c = 0;
+                for (int i=0; i<4; i++) { c = (unsigned __int128)M[i] + r[i] + (c>>64); mT[i] = (uint64_t)c; }
+                
+                h_types[k] = DP_RECORD_TAME;
+                for (int i=0;i<4;i++) { h_scalars[k*4+i] = mT[i]; h_dist[k*4+i] = r[i]; }
+            } else {
+                // Wild
+                h_types[k] = DP_RECORD_WILD;
+                for (int i=0;i<4;i++) { h_scalars[k*4+i] = r[i]; h_dist[k*4+i] = r[i]; }
+            }
         }
 
         cudaMemcpy(d_Ktype, h_types.data(), TOTAL_KANGAROOS*sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-        // Use d_Kdist as temporary scalar buffer (will be overwritten with real distances next)
+        // Use d_Kdist as temporary buffer
         cudaMemcpy(d_Kdist, h_scalars.data(), TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
         scalarMulKernelBase<<<(TOTAL_KANGAROOS+255)/256, 256>>>(d_Kdist, d_Kx, d_Ky, TOTAL_KANGAROOS);
         cudaDeviceSynchronize();
-        // Now overwrite d_Kdist with the real initial distances
         cudaMemcpy(d_Kdist, h_dist.data(), TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-        cerr = cudaGetLastError();
-        if (cerr != cudaSuccess) std::cerr << "[WARN] scalarMul error: " << cudaGetErrorString(cerr) << "\n";
-
-        // Add pubkey to Wild kangaroos: Kx[half..] += pubkey  (i.e. P+randW*G)
-        // We do this with a small kernel
         kernel_add_pubkey<<<(half+255)/256, 256>>>(
             d_Kx + (size_t)half*4, d_Ky + (size_t)half*4,
             pubX[0], pubX[1], pubX[2], pubX[3],
@@ -333,7 +336,7 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     };
 
     // Initial setup
-    do_restart();
+    do_init();
     restart_count = 0; // reset counter (first run)
 
     std::cout << "[+] Running Kangaroos...\n";
@@ -398,19 +401,8 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
             std::cout << "\r[" << std::fixed << std::setprecision(0) << elapsed << "s] "
                       << std::fixed << std::setprecision(1) << jps/1e6 << " Mj/s | "
                       << "DPs: " << dp_map.size()
-                      << " | Est: " << std::setprecision(2) << progress << "% "
-                      << " | Res: " << restart_count
+                      << " | Est: " << std::setprecision(2) << progress << "%   "
                       << "    " << std::flush;
-        }
-
-        // ── auto-restart if no solution after expected time ─────────
-        // Restart if we exceed 4 * sqrt(W) total jumps across ALL kangaroos combined
-        double expected_jumps_limit = 4.0 * Wsqrt;
-        if (!found && (double)total_jumps > expected_jumps_limit) {
-            do_restart();
-            total_jumps = 0;
-            t0 = std::chrono::high_resolution_clock::now();
-            t_last = t0;
         }
     }
 

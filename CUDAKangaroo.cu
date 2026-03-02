@@ -116,7 +116,7 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
 
     uint64_t W[4]; host_sub256(W, range_end, range_start);
     long double W_ld  = ld_from_u256(W);
-    long double Wsqrt = std::sqrtl(W_ld);
+    long double Wsqrt = ::sqrtl(W_ld);
 
     int pow2W    = (int)std::round(std::log2l(W_ld));
     int pow2Jmax = getPow2Jmax(Wsqrt / 2.0L);

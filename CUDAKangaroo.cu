@@ -337,7 +337,6 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
 
     // Initial setup
     do_init();
-    restart_count = 0; // reset counter (first run)
 
     std::cout << "[+] Running Kangaroos...\n";
     int blocks = (threadsTotal + 255) / 256;

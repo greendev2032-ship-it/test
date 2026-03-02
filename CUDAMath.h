@@ -334,7 +334,7 @@ __device__ __forceinline__ uint32_t ctz(uint64_t x) {
 }
 
 #define SWAP(tmp,x,y) tmp = x; x = y; y = tmp;
-#define MSK62 0x3FFFFFFFFFFFFFFF
+#define SWAP(tmp,x,y) tmp = x; x = y; y = tmp;
 
 __device__ __forceinline__ void _DivStep62(uint64_t u[5],uint64_t v[5],
                            int32_t *pos,
@@ -1219,7 +1219,7 @@ __device__ __forceinline__ void scalarMulBaseAffine(const uint64_t* scalar_le, u
     }
 }
 
-__global__ __forceinline__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N) {
+__global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 

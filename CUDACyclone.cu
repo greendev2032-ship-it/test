@@ -27,6 +27,8 @@ __device__ FoundResult found_result;
 __device__ int found_flag = 0;
 __device__ __constant__ uint64_t Gx_d[4];
 __device__ __constant__ uint64_t Gy_d[4];
+__device__ __constant__ uint64_t MM64 = 0xD838091DD2253531ULL;
+__device__ __constant__ uint64_t MSK62 = 0x3FFFFFFFFFFFFFFFULL;
 
 static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }

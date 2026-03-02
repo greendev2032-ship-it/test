@@ -28,8 +28,8 @@
 
 #define HSIZE (GRP_SIZE / 2 - 1)
 
-__device__ __constant__ uint64_t MM64 = 0xD838091DD2253531ULL;
-__device__ __constant__ uint64_t MSK62 = 0x3FFFFFFFFFFFFFFFULL;
+extern __device__ __constant__ uint64_t MM64;
+extern __device__ __constant__ uint64_t MSK62;
 
 #define _IsPositive(x) (((int64_t)(x[4]))>=0LL)
 #define _IsNegative(x) (((int64_t)(x[4]))<0LL)
@@ -635,7 +635,7 @@ __device__ __forceinline__ void _ModMult(uint64_t *r, uint64_t *a, uint64_t *b) 
 
 
 
-__device__ void _ModMult(uint64_t *r, uint64_t *a) {
+__device__ __forceinline__ void _ModMult(uint64_t *r, uint64_t *a) {
 
   uint64_t r512[8];
   uint64_t t[NBBLOCK];

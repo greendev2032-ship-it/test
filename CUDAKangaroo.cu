@@ -96,8 +96,10 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex, uin
         halfW[i] >>= 1;
     }
     uint64_t M[4];
-    add256_device(range_start, halfW); // wait, add256_device modifies the first arg.
-    M[0] = range_start[0]; M[1] = range_start[1]; M[2] = range_start[2]; M[3] = range_start[3];
+    unsigned __int128 cc_M = (unsigned __int128)range_start[0] + halfW[0];
+    M[0] = (uint64_t)cc_M; uint64_t cy_M = (uint64_t)(cc_M >> 64);
+    for (int i=1; i<4; i++) { cc_M = (unsigned __int128)range_start[i] + halfW[i] + cy_M; M[i] = (uint64_t)cc_M; cy_M = (uint64_t)(cc_M >> 64); }
+    
     unsigned __int128 cc = (unsigned __int128)M[0] + halfW[0]; 
     M[0] = (uint64_t)cc; uint64_t cy = (uint64_t)(cc >> 64);
     for (int i=1; i<4; i++) { cc = (unsigned __int128)M[i] + halfW[i] + cy; M[i] = (uint64_t)cc; cy = (uint64_t)(cc >> 64); }
@@ -139,7 +141,9 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex, uin
         else if (wsqrt_bits < 128) { rW[1] &= (1ULL << (wsqrt_bits-64)) - 1; rW[2]=0; rW[3]=0; }
 
         uint64_t mT[4] = {M[0], M[1], M[2], M[3]};
-        add256_device(mT, rT);
+        unsigned __int128 cc_mT = (unsigned __int128)mT[0] + rT[0];
+        mT[0] = (uint64_t)cc_mT; uint64_t cy_mT = (uint64_t)(cc_mT >> 64);
+        for (int i=1; i<4; i++) { cc_mT = (unsigned __int128)mT[i] + rT[i] + cy_mT; mT[i] = (uint64_t)cc_mT; cy_mT = (uint64_t)(cc_mT >> 64); }
 
         for(int i=0; i<4; i++) {
             h_start_scalars[k*4 + i] = mT[i];
@@ -242,7 +246,9 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex, uin
                         uint64_t target_key_calc[4];
                         // M + D_T = PrivateKey + D_W => PrivateKey = M + D_T - D_W
                         uint64_t MT[4] = {M[0], M[1], M[2], M[3]};
-                        add256_device(MT, tame_dist); // MT = M + D_T
+                        unsigned __int128 cc_MT = (unsigned __int128)MT[0] + tame_dist[0];
+                        MT[0] = (uint64_t)cc_MT; uint64_t cy_MT = (uint64_t)(cc_MT >> 64);
+                        for (int j=1; j<4; j++) { cc_MT = (unsigned __int128)MT[j] + tame_dist[j] + cy_MT; MT[j] = (uint64_t)cc_MT; cy_MT = (uint64_t)(cc_MT >> 64); }
                         
                         // We need sub256 for MT - D_W. Let's use CPU arithmetic.
                         uint64_t borrow = 0;

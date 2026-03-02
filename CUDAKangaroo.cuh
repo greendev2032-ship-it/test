@@ -16,6 +16,13 @@ __constant__ uint64_t c_SpY[MAX_JUMP_POINTS * 4];
 #define DP_RECORD_TAME 0
 #define DP_RECORD_WILD 1
 
+struct DPRecord {
+    uint32_t type;
+    uint32_t threadId;
+    uint64_t X[4];
+    uint64_t distance[4];
+};
+
 __device__ __forceinline__ void add256_device(uint64_t a[4], const uint64_t b[4]) {
     unsigned __int128 cur = (unsigned __int128)a[0] + b[0];
     a[0] = (uint64_t)cur;

@@ -279,7 +279,7 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
         kernel_kangaroo_jump<<<blocks, 256>>>(
             d_Kx, d_Ky, d_Kdist, d_Ktype,
             threadsTotal, KANGAROOS_PER_THREAD, slices,
-            (uint32_t)(1 << pow2Jmax), dp_mask,
+            (uint32_t)pow2Jmax, dp_mask,
             d_dp_buffer, d_dp_count, MAX_DPS);
         cudaDeviceSynchronize();
         total_jumps += (uint64_t)TOTAL_KANGAROOS * slices;
@@ -334,8 +334,11 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
                       << "    " << std::flush;
         }
 
-        // ── auto-restart if no solution after ~4*sqrt(W) jumps ─────────
-        if (!found && total_jumps > (uint64_t)(4.0L * Wsqrt * TOTAL_KANGAROOS)) {
+        // ── auto-restart if no solution after ~4*sqrt(W) jumps per kangaroo ─────────
+        // Expected collision at ~2*sqrt(W) total jumps (across all kangaroos)
+        // We restart when each kangaroo has jumped ~4*sqrt(W) steps with no success
+        uint64_t restart_threshold = (uint64_t)(4.0L * Wsqrt) * slices;
+        if (!found && (total_jumps / TOTAL_KANGAROOS) > restart_threshold) {
             do_restart();
             total_jumps = 0;
             t0 = std::chrono::high_resolution_clock::now();

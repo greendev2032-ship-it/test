@@ -114,7 +114,7 @@ USUB(r[4],0ULL,r[4]); }
   (r)[2] = (a)[2]; \
   (r)[3] = (a)[3];}
 
-__device__ void ShiftR62(uint64_t r[5]) {
+__device__ __forceinline__ void ShiftR62(uint64_t r[5]) {
 
   r[0] = (r[1] << 2) | (r[0] >> 62);
   r[1] = (r[2] << 2) | (r[1] >> 62);
@@ -124,7 +124,7 @@ __device__ void ShiftR62(uint64_t r[5]) {
 
 }
 
-__device__ void ModSub256isOdd(uint64_t* a, uint64_t* b, uint8_t* parity) {    //no need to compute py, we need only parity
+__device__ __forceinline__ void ModSub256isOdd(uint64_t* a, uint64_t* b, uint8_t* parity) {    //no need to compute py, we need only parity
 
     uint64_t t;   
     uint64_t T[4]; 
@@ -140,7 +140,7 @@ __device__ void ModSub256isOdd(uint64_t* a, uint64_t* b, uint8_t* parity) {    /
 }
 
 
-__device__ void ShiftR62(uint64_t dest[5],uint64_t r[5],uint64_t carry) {
+__device__ __forceinline__ void ShiftR62(uint64_t dest[5],uint64_t r[5],uint64_t carry) {
 
   dest[0] = (r[1] << 2) | (r[0] >> 62);
   dest[1] = (r[2] << 2) | (r[1] >> 62);
@@ -150,7 +150,7 @@ __device__ void ShiftR62(uint64_t dest[5],uint64_t r[5],uint64_t carry) {
 
 }
 
-__device__ void IMult(uint64_t *r,uint64_t *a,int64_t b) {
+__device__ __forceinline__ void IMult(uint64_t *r,uint64_t *a,int64_t b) {
 
   uint64_t t[NBBLOCK];
 
@@ -177,7 +177,7 @@ __device__ void IMult(uint64_t *r,uint64_t *a,int64_t b) {
 
 }
 
-__device__ uint64_t IMultC(uint64_t* r,uint64_t* a,int64_t b) {
+__device__ __forceinline__ uint64_t IMultC(uint64_t* r,uint64_t* a,int64_t b) {
 
   uint64_t t[NBBLOCK];
   uint64_t carry;
@@ -208,7 +208,7 @@ __device__ uint64_t IMultC(uint64_t* r,uint64_t* a,int64_t b) {
 
 }
 
-__device__ void MulP(uint64_t *r,uint64_t a) {
+__device__ __forceinline__ void MulP(uint64_t *r,uint64_t a) {
 
   uint64_t ah;
   uint64_t al;
@@ -224,7 +224,7 @@ __device__ void MulP(uint64_t *r,uint64_t a) {
 
 }
 
-__device__ void ModNeg256(uint64_t *r,uint64_t *a) {
+__device__ __forceinline__ void ModNeg256(uint64_t *r,uint64_t *a) {
 
   uint64_t t[4];
   USUBO(t[0],0ULL,a[0]);
@@ -238,7 +238,7 @@ __device__ void ModNeg256(uint64_t *r,uint64_t *a) {
 
 }
 
-__device__ void ModNeg256(uint64_t *r) {
+__device__ __forceinline__ void ModNeg256(uint64_t *r) {
 
   uint64_t t[4];
   USUBO(t[0],0ULL,r[0]);
@@ -252,7 +252,7 @@ __device__ void ModNeg256(uint64_t *r) {
 
 }
 
-__device__ void ModSub256(uint64_t *r,uint64_t *a,uint64_t *b) {
+__device__ __forceinline__ void ModSub256(uint64_t *r,uint64_t *a,uint64_t *b) {
 
     uint64_t borrow;
     uint64_t p[4] = { 0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
@@ -271,7 +271,7 @@ __device__ void ModSub256(uint64_t *r,uint64_t *a,uint64_t *b) {
         UADD1(r[3], p[3]);
     }
 }
-__device__ void ModSub256(uint64_t* r,uint64_t* b) {
+__device__ __forceinline__ void ModSub256(uint64_t* r,uint64_t* b) {
 
     uint64_t borrow;
     uint64_t p[4] = { 0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
@@ -336,7 +336,7 @@ __device__ __forceinline__ uint32_t ctz(uint64_t x) {
 #define SWAP(tmp,x,y) tmp = x; x = y; y = tmp;
 #define MSK62 0x3FFFFFFFFFFFFFFF
 
-__device__ void _DivStep62(uint64_t u[5],uint64_t v[5],
+__device__ __forceinline__ void _DivStep62(uint64_t u[5],uint64_t v[5],
                            int32_t *pos,
                            int64_t* uu,int64_t* uv,
                            int64_t* vu,int64_t* vv) {
@@ -402,7 +402,7 @@ __device__ void _DivStep62(uint64_t u[5],uint64_t v[5],
 
 }
 
-__device__ void MatrixVecMulHalf(uint64_t dest[5],uint64_t u[5],uint64_t v[5],int64_t _11,int64_t _12,uint64_t* carry) {
+__device__ __forceinline__ void MatrixVecMulHalf(uint64_t dest[5],uint64_t u[5],uint64_t v[5],int64_t _11,int64_t _12,uint64_t* carry) {
 
   uint64_t t1[NBBLOCK];
   uint64_t t2[NBBLOCK];
@@ -420,7 +420,7 @@ __device__ void MatrixVecMulHalf(uint64_t dest[5],uint64_t u[5],uint64_t v[5],in
 
 }
 
-__device__ void MatrixVecMul(uint64_t u[5],uint64_t v[5],int64_t _11,int64_t _12,int64_t _21,int64_t _22) {
+__device__ __forceinline__ void MatrixVecMul(uint64_t u[5],uint64_t v[5],int64_t _11,int64_t _12,int64_t _21,int64_t _22) {
 
   uint64_t t1[NBBLOCK];
   uint64_t t2[NBBLOCK];
@@ -446,7 +446,7 @@ __device__ void MatrixVecMul(uint64_t u[5],uint64_t v[5],int64_t _11,int64_t _12
 
 }
 
-__device__ uint64_t AddCh(uint64_t r[5],uint64_t a[5],uint64_t carry) {
+__device__ __forceinline__ uint64_t AddCh(uint64_t r[5],uint64_t a[5],uint64_t carry) {
 
   uint64_t carryOut;
 
@@ -461,7 +461,7 @@ __device__ uint64_t AddCh(uint64_t r[5],uint64_t a[5],uint64_t carry) {
 
 }
 
-__device__ __noinline__ void _ModInv(uint64_t* R) {
+__device__ __forceinline__ void _ModInv(uint64_t* R) {
 
     // Compute modular inverse of R mop P (using 320bits signed integer)
     // 0 < this < P  , P must be odd
@@ -582,7 +582,7 @@ __device__ __noinline__ void _ModInv(uint64_t* R) {
 }
 
 
-__device__ void _ModMult(uint64_t *r, uint64_t *a, uint64_t *b) {
+__device__ __forceinline__ void _ModMult(uint64_t *r, uint64_t *a, uint64_t *b) {
 
   uint64_t r512[8];
   uint64_t t[NBBLOCK];
@@ -682,7 +682,7 @@ __device__ void _ModMult(uint64_t *r, uint64_t *a) {
   UADD(r[3], r512[3], 0ULL);
 
 }
-__device__ void _ModSqr(uint64_t *rp,const uint64_t *up) {
+__device__ __forceinline__ void _ModSqr(uint64_t *rp,const uint64_t *up) {
 
   uint64_t r512[8];
 
@@ -920,28 +920,28 @@ __device__ void _ModSqr(uint64_t *rp,const uint64_t *up) {
 
 }
 
-__device__ void fieldInv(const uint64_t in[4], uint64_t out[4]) {
+__device__ __forceinline__ void fieldInv(const uint64_t* a, uint64_t* r) {
     uint64_t t[5];
-    t[0] = in[0];
-    t[1] = in[1];
-    t[2] = in[2];
-    t[3] = in[3];
+    t[0] = a[0];
+    t[1] = a[1];
+    t[2] = a[2];
+    t[3] = a[3];
     t[4] = 0;
     _ModInv(t);
-    out[0] = t[0];
-    out[1] = t[1];
-    out[2] = t[2];
-    out[3] = t[3];
+    r[0] = t[0];
+    r[1] = t[1];
+    r[2] = t[2];
+    r[3] = t[3];
 }
 
-__device__ void mul64x64_128(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi) {
-    *lo = a * b;
-    *hi = __umul64hi(a, b);
+__device__ __forceinline__ void mul64x64_128(uint64_t A, uint64_t B, uint64_t* result_low, uint64_t* result_high) {
+    *result_low = A * B;
+    *result_high = __umul64hi(A, B);
 }
 
-__device__ uint64_t addWithCarry(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t* carry_out) {
-    uint64_t sum = a + b + carry_in;
-    *carry_out = (sum < a) || (carry_in && sum == a) ? 1 : 0;
+__device__ __forceinline__ uint64_t addWithCarry(uint64_t A, uint64_t B, uint64_t carry_in, uint64_t* carry_out) {
+    uint64_t sum = A + B + carry_in;
+    *carry_out = (sum < A) || (carry_in && sum == A) ? 1 : 0;
     return sum;
 }
 
@@ -978,89 +978,89 @@ __device__ __forceinline__ bool fieldIsZero(const uint64_t a[4]) {
     return ( (a[0] | a[1] | a[2] | a[3]) == 0ULL );
 }
 
-__device__ void fieldAdd(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
+__device__ __forceinline__ void fieldAdd(const uint64_t* a, const uint64_t* b, uint64_t* r) {
     __uint128_t t = 0;
     uint64_t c = 0;
 
     t = (__uint128_t)a[0] + b[0];
-    out[0] = (uint64_t)t;
+    r[0] = (uint64_t)t;
     c = (uint64_t)(t >> 64);
 
     t = (__uint128_t)a[1] + b[1] + c;
-    out[1] = (uint64_t)t;
+    r[1] = (uint64_t)t;
     c = (uint64_t)(t >> 64);
 
     t = (__uint128_t)a[2] + b[2] + c;
-    out[2] = (uint64_t)t;
+    r[2] = (uint64_t)t;
     c = (uint64_t)(t >> 64);
 
     t = (__uint128_t)a[3] + b[3] + c;
-    out[3] = (uint64_t)t;
+    r[3] = (uint64_t)t;
     c = (uint64_t)(t >> 64); 
 
-    if (c || (out[3] > SECP_P_LE[3]) || 
-        (out[3] == SECP_P_LE[3] && out[2] > SECP_P_LE[2]) || 
-        (out[3] == SECP_P_LE[3] && out[2] == SECP_P_LE[2] && out[1] > SECP_P_LE[1]) || 
-        (out[3] == SECP_P_LE[3] && out[2] == SECP_P_LE[2] && out[1] == SECP_P_LE[1] && out[0] >= SECP_P_LE[0])) {
+    if (c || (r[3] > SECP_P_LE[3]) || 
+        (r[3] == SECP_P_LE[3] && r[2] > SECP_P_LE[2]) || 
+        (r[3] == SECP_P_LE[3] && r[2] == SECP_P_LE[2] && r[1] > SECP_P_LE[1]) || 
+        (r[3] == SECP_P_LE[3] && r[2] == SECP_P_LE[2] && r[1] == SECP_P_LE[1] && r[0] >= SECP_P_LE[0])) {
 
         __uint128_t tb;
         uint64_t borrow = 0;
-        tb = (__uint128_t)out[0] - SECP_P_LE[0];
-        out[0] = (uint64_t)tb;
+        tb = (__uint128_t)r[0] - SECP_P_LE[0];
+        r[0] = (uint64_t)tb;
         borrow = (tb > 0xFFFFFFFFFFFFFFFFULL) ? 1 : 0;
 
-        tb = (__uint128_t)out[1] - SECP_P_LE[1] - borrow;
-        out[1] = (uint64_t)tb;
+        tb = (__uint128_t)r[1] - SECP_P_LE[1] - borrow;
+        r[1] = (uint64_t)tb;
         borrow = (tb > 0xFFFFFFFFFFFFFFFFULL) ? 1 : 0;
 
-        tb = (__uint128_t)out[2] - SECP_P_LE[2] - borrow;
-        out[2] = (uint64_t)tb;
+        tb = (__uint128_t)r[2] - SECP_P_LE[2] - borrow;
+        r[2] = (uint64_t)tb;
         borrow = (tb > 0xFFFFFFFFFFFFFFFFULL) ? 1 : 0;
 
-        tb = (__uint128_t)out[3] - SECP_P_LE[3] - borrow;
-        out[3] = (uint64_t)tb;
+        tb = (__uint128_t)r[3] - SECP_P_LE[3] - borrow;
+        r[3] = (uint64_t)tb;
     }
 }
 
-__device__ void fieldSub(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
+__device__ __forceinline__ void fieldSub(const uint64_t* a, const uint64_t* b, uint64_t* r) {
     __int128_t t;
     uint64_t borrow = 0;
 
     t = (__int128_t)a[0] - b[0];
-    out[0] = (uint64_t)t; borrow = (t < 0);
+    r[0] = (uint64_t)t; borrow = (t < 0);
 
     t = (__int128_t)a[1] - b[1] - borrow;
-    out[1] = (uint64_t)t; borrow = (t < 0);
+    r[1] = (uint64_t)t; borrow = (t < 0);
 
     t = (__int128_t)a[2] - b[2] - borrow;
-    out[2] = (uint64_t)t; borrow = (t < 0);
+    r[2] = (uint64_t)t; borrow = (t < 0);
 
     t = (__int128_t)a[3] - b[3] - borrow;
-    out[3] = (uint64_t)t; borrow = (t < 0);
+    r[3] = (uint64_t)t; borrow = (t < 0);
 
     if (borrow) {
         __uint128_t tu;
         uint64_t carry = 0;
-        tu = (__uint128_t)out[0] + SECP_P_LE[0];
-        out[0] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
+        tu = (__uint128_t)r[0] + SECP_P_LE[0];
+        r[0] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
 
-        tu = (__uint128_t)out[1] + SECP_P_LE[1] + carry;
-        out[1] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
+        tu = (__uint128_t)r[1] + SECP_P_LE[1] + carry;
+        r[1] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
 
-        tu = (__uint128_t)out[2] + SECP_P_LE[2] + carry;
-        out[2] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
+        tu = (__uint128_t)r[2] + SECP_P_LE[2] + carry;
+        r[2] = (uint64_t)tu; carry = (uint64_t)(tu >> 64);
 
-        tu = (__uint128_t)out[3] + SECP_P_LE[3] + carry;
-        out[3] = (uint64_t)tu;
+        tu = (__uint128_t)r[3] + SECP_P_LE[3] + carry;
+        r[3] = (uint64_t)tu;
     }
 }
 
-__device__ void fieldNeg(const uint64_t a[4], uint64_t out[4]) {
+__device__ __forceinline__ void fieldNeg(const uint64_t* a, uint64_t* r) {
     if (fieldIsZero(a)) {
-        out[0]=out[1]=out[2]=out[3]=0ULL;
+        r[0]=r[1]=r[2]=r[3]=0ULL;
         return;
     }
-    fieldSub(SECP_P_LE, a, out);
+    fieldSub(SECP_P_LE, a, r);
 }
 
 __device__ __forceinline__ void fieldMul(const uint64_t a[4], const uint64_t b[4], uint64_t out[4]) {
@@ -1095,7 +1095,7 @@ __device__ __forceinline__ void pointSetG(ECPointA &P) {
     P.Y[2] = SECP_GY_LE[2];
     P.Y[3] = SECP_GY_LE[3];
 }
-__device__ void pointDoubleAffine(const ECPointA &P, ECPointA &R) {
+__device__ __forceinline__ void pointDoubleAffine(const ECPointA &P, ECPointA &R) {
     if (P.infinity) { pointSetInfinity(R); return; }
 
     uint64_t x2[4], two_x2[4], three_x2[4];
@@ -1125,7 +1125,7 @@ __device__ void pointDoubleAffine(const ECPointA &P, ECPointA &R) {
     R.infinity = false;
 }
 
-__device__ void pointAddAffine(const ECPointA &P, const ECPointA &Q, ECPointA &R) {
+__device__ __forceinline__ void pointAddAffine(const ECPointA &P, const ECPointA &Q, ECPointA &R) {
     if (P.infinity) { R = Q; return; }
     if (Q.infinity) { R = P; return; }
 
@@ -1166,7 +1166,7 @@ __device__ void pointAddAffine(const ECPointA &P, const ECPointA &Q, ECPointA &R
     R.infinity = false;
 }
 
-__device__ void scalarMulBaseAffine(const uint64_t scalar_le[4], uint64_t outX[4], uint64_t outY[4]) {
+__device__ __forceinline__ void scalarMulBaseAffine(const uint64_t* scalar_le, uint64_t* outX, uint64_t* outY) {
     ECPointA R;
     pointSetInfinity(R);
 
@@ -1219,7 +1219,7 @@ __device__ void scalarMulBaseAffine(const uint64_t scalar_le[4], uint64_t outX[4
     }
 }
 
-__global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N) {
+__global__ __forceinline__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 

@@ -21,6 +21,13 @@
 #include "CUDAUtils.h"
 #include "CUDAStructures.h"
 
+__device__ __constant__ uint8_t  c_target_hash160[20];
+__device__ __constant__ uint32_t c_target_prefix;
+__device__ FoundResult found_result;
+__device__ int found_flag = 0;
+__device__ __constant__ uint64_t Gx_d[4];
+__device__ __constant__ uint64_t Gy_d[4];
+
 static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }
 

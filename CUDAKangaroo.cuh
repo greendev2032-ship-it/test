@@ -10,8 +10,8 @@
 // Max jump points we keep in constant memory
 #define MAX_JUMP_POINTS 256
 
-__constant__ uint64_t c_SpX[MAX_JUMP_POINTS * 4];
-__constant__ uint64_t c_SpY[MAX_JUMP_POINTS * 4];
+extern __constant__ uint64_t c_SpX[MAX_JUMP_POINTS * 4];
+extern __constant__ uint64_t c_SpY[MAX_JUMP_POINTS * 4];
 
 #define DP_RECORD_TAME 0
 #define DP_RECORD_WILD 1
@@ -32,6 +32,37 @@ __device__ __forceinline__ void add256_device(uint64_t a[4], const uint64_t b[4]
         a[i] = (uint64_t)cur;
         carry = (uint64_t)(cur >> 64);
     }
+}
+
+__global__ void kernel_add_pubkey(uint64_t* K_x, uint64_t* K_y, 
+    uint64_t tX0, uint64_t tX1, uint64_t tX2, uint64_t tX3, 
+    uint64_t tY0, uint64_t tY1, uint64_t tY2, uint64_t tY3, int N)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= N) return;
+    
+    uint64_t x1[4] = {K_x[gid*4], K_x[gid*4+1], K_x[gid*4+2], K_x[gid*4+3]};
+    uint64_t y1[4] = {K_y[gid*4], K_y[gid*4+1], K_y[gid*4+2], K_y[gid*4+3]};
+    uint64_t px_i[4] = {tX0, tX1, tX2, tX3};
+    uint64_t py_i[4] = {tY0, tY1, tY2, tY3};
+
+    uint64_t dx[4]; ModSub256(dx, px_i, x1);
+    uint64_t inv[5] = {dx[0], dx[1], dx[2], dx[3], 0};
+    _ModInv(inv);
+
+    uint64_t dy[4]; ModSub256(dy, py_i, y1);
+    uint64_t lam[4]; _ModMult(lam, dy, inv);
+
+    uint64_t x3[4]; _ModSqr(x3, lam);
+    ModSub256(x3, x3, x1);
+    ModSub256(x3, x3, px_i);
+
+    uint64_t s[4], y3[4]; 
+    ModSub256(s, x1, x3); 
+    _ModMult(y3, s, lam); 
+    ModSub256(y3, y3, y1);
+
+    for(int i=0; i<4; ++i) { K_x[gid*4+i] = x3[i]; K_y[gid*4+i] = y3[i]; }
 }
 
 __launch_bounds__(256, 1)

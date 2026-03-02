@@ -1,298 +1,363 @@
 #include <iostream>
 #include <iomanip>
+#include <fstream>
 #include <string>
 #include <cmath>
 #include <chrono>
-#include <thread>
-#include <unordered_map>
 #include <vector>
+#include <unordered_map>
+#include <random>
+#include <sstream>
 
 #include "CUDAKangaroo.cuh"
-
 #include "CUDAUtils.h"
+
+__constant__ uint64_t c_SpX[MAX_JUMP_POINTS * 4];
+__constant__ uint64_t c_SpY[MAX_JUMP_POINTS * 4];
 
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern std::string formatHex256(const uint64_t limbs[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
-extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
+
+// Forward declaration
 extern __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
-__global__ void kernel_add_pubkey(uint64_t* K_x, uint64_t* K_y, 
-    uint64_t tX0, uint64_t tX1, uint64_t tX2, uint64_t tX3, 
-    uint64_t tY0, uint64_t tY1, uint64_t tY2, uint64_t tY3, int N) 
-{
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (gid >= N) return;
-    
-    uint64_t x1[4] = {K_x[gid*4], K_x[gid*4+1], K_x[gid*4+2], K_x[gid*4+3]};
-    uint64_t y1[4] = {K_y[gid*4], K_y[gid*4+1], K_y[gid*4+2], K_y[gid*4+3]};
-    uint64_t px_i[4] = {tX0, tX1, tX2, tX3};
-    uint64_t py_i[4] = {tY0, tY1, tY2, tY3};
+// ------------------------------------------------------------------
+// Host-side helpers
+// ------------------------------------------------------------------
+static void host_add256(uint64_t out[4], const uint64_t a[4], const uint64_t b[4]) {
+    unsigned __int128 c = 0;
+    for (int i = 0; i < 4; i++) {
+        c = (unsigned __int128)a[i] + b[i] + (c >> 64);
+        out[i] = (uint64_t)c;
+    }
+}
+static void host_sub256(uint64_t out[4], const uint64_t a[4], const uint64_t b[4]) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t bi = b[i] + borrow;
+        if (a[i] < bi) { out[i] = (uint64_t)((((unsigned __int128)1)<<64) + a[i] - bi); borrow = 1; }
+        else           { out[i] = a[i] - bi; borrow = 0; }
+    }
+}
+static bool host_gt256(const uint64_t a[4], const uint64_t b[4]) {
+    for (int i = 3; i >= 0; i--) {
+        if (a[i] > b[i]) return true;
+        if (a[i] < b[i]) return false;
+    }
+    return false;
+}
+static void host_shr1_256(uint64_t a[4]) {
+    for (int i = 0; i < 3; i++) a[i] = (a[i] >> 1) | (a[i+1] << 63);
+    a[3] >>= 1;
+}
 
-    uint64_t dx[4]; ModSub256(dx, px_i, x1);
-    uint64_t inv[5] = {dx[0], dx[1], dx[2], dx[3], 0};
-    _ModInv(inv);
+// Decompress a '02'/'03' pubkey to X, Y in little-endian uint64 arrays.
+// Returns false if format is invalid.
+static bool decompressPubkey(const std::string& hex, uint64_t X[4], uint64_t Y[4]) {
+    if (hex.size() == 130 && hex.substr(0,2) == "04") {
+        hexToLE64(hex.substr(2, 64), X);
+        hexToLE64(hex.substr(66, 64), Y);
+        return true;
+    }
+    // Compressed
+    if (hex.size() != 66) return false;
+    int prefix = std::stoi(hex.substr(0,2), nullptr, 16);
+    if (prefix != 0x02 && prefix != 0x03) return false;
+    hexToLE64(hex.substr(2, 64), X);
 
-    uint64_t dy[4]; ModSub256(dy, py_i, y1);
-    uint64_t lam[4]; _ModMult(lam, dy, inv);
-
-    uint64_t x3[4]; _ModSqr(x3, lam);
-    ModSub256(x3, x3, x1);
-    ModSub256(x3, x3, px_i);
-
-    uint64_t s[4], y3[4]; 
-    ModSub256(s, x1, x3); 
-    _ModMult(y3, s, lam); 
-    ModSub256(y3, y3, y1);
-
-    for(int i=0; i<4; ++i) { K_x[gid*4+i] = x3[i]; K_y[gid*4+i] = y3[i]; }
+    // Secp256k1 p
+    static const uint64_t P[4] = {0xFFFFFFFEFFFFFC2FULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL};
+    // y² = x³ + 7 (mod p), we need Y on device - use Python logic on CPU
+    // For simplicity, use a small GPU call: compute Y using scalarMulBaseAffine indirectly.
+    // Actually we only need Y from X using x^3 + 7 mod p on CPU with __int128.
+    // We'll do it using Tonelli–Shanks exponent (p+1)/4 since p≡3 mod 4.
+    // (p+1)/4 = 0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
+    // Use bignum with uint64_t[4].
+    // Defer: pass X, compute Y on GPU indirectly via a helper.
+    // For now a simplified path using device later.
+    // STUB: just set Y to 0 and let user pass uncompressed.
+    Y[0]=Y[1]=Y[2]=Y[3]=0;
+    std::cerr << "[warn] Compressed pubkey support: Y coordinate not computed. Please use uncompressed (04...) pubkey for now.\n";
+    return false;
 }
 
 int getPow2Jmax(long double optimalmeanjumpsize) {
     long double sumjumpsize = 0;
-    for(int i = 1; i < 256; ++i) {
-        sumjumpsize += std::pow(2.0, i - 1);
-        long double now_mean = sumjumpsize / i;
-        long double next_mean = (sumjumpsize + std::pow(2.0, i)) / i;
-        if (optimalmeanjumpsize - now_mean <= next_mean - optimalmeanjumpsize) {
+    for (int i = 1; i < 256; ++i) {
+        sumjumpsize += std::pow(2.0L, i - 1);
+        long double now_mean  = sumjumpsize / i;
+        long double next_mean = (sumjumpsize + std::pow(2.0L, i)) / i;
+        if (optimalmeanjumpsize - now_mean <= next_mean - optimalmeanjumpsize)
             return i;
-        }
     }
-    return 255;
+    return 32;
 }
 
-int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex, uint32_t a, uint32_t b, uint32_t slices) {
-    std::cout << "======== Phase-1: Kangaroo Parameters =================\n";
+// ------------------------------------------------------------------
+// runKangaroo — called from main()
+// ------------------------------------------------------------------
+int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
+                uint32_t a, uint32_t /*b*/, uint32_t slices) {
 
-    size_t colon_pos = range_hex.find(':');
-    std::string start_hex = range_hex.substr(0, colon_pos);
-    std::string end_hex   = range_hex.substr(colon_pos + 1);
+    std::cout << "\n[################################################]\n";
+    std::cout << "[#   GPU Pollard-Kangaroo PrivKey Recovery      #]\n";
+    std::cout << "[#         bitcoin ecdsa secp256k1             #]\n";
+    std::cout << "[################################################]\n\n";
 
-    uint64_t range_start[4]{0}, range_end[4]{0};
-    hexToLE64(start_hex, range_start);
-    hexToLE64(end_hex, range_end);
-    
-    // W = end - start
-    uint64_t W[4];
-    uint64_t borrow = 0;
-    for(int i=0; i<4; i++) {
-        uint64_t bi = range_start[i] + borrow;
-        if (range_end[i] < bi) { W[i] = (uint64_t)((((unsigned __int128)1)<<64) + range_end[i] - bi); borrow = 1; }
-        else { W[i] = range_end[i] - bi; borrow = 0; }
-    }
+    // ── parse range ────────────────────────────────────────────────
+    size_t colon = range_hex.find(':');
+    if (colon == std::string::npos) { std::cerr << "Error: --range must be start:end\n"; return 1; }
+    uint64_t range_start[4]{}, range_end[4]{};
+    hexToLE64(range_hex.substr(0, colon), range_start);
+    hexToLE64(range_hex.substr(colon + 1), range_end);
 
-    long double W_ld = ld_from_u256(W);
-    long double Wsqrt = std::sqrt(W_ld);
-    long double midJsize = Wsqrt / 2.0;
+    if (!host_gt256(range_end, range_start)) { std::cerr << "Error: range_end <= range_start\n"; return 1; }
 
-    int pow2W = (int)std::round(std::log2(W_ld));
-    int pow2Jmax = getPow2Jmax(midJsize);
-    int pow2dp = (pow2W / 2) - 2;
-    if (pow2dp < 0) pow2dp = 0;
-    uint32_t dp_mask_lsb = (1ULL << pow2dp) - 1; 
+    uint64_t W[4]; host_sub256(W, range_end, range_start);
+    long double W_ld  = ld_from_u256(W);
+    long double Wsqrt = std::sqrtl(W_ld);
 
-    // M = start + W/2
-    uint64_t halfW[4] = {W[0], W[1], W[2], W[3]};
-    for(int i=3; i>=0; --i) {
-        if (i>0) halfW[i-1] |= (halfW[i] & 1) ? (1ULL<<63) : 0;
-        halfW[i] >>= 1;
-    }
-    uint64_t M[4];
-    unsigned __int128 cc_M = (unsigned __int128)range_start[0] + halfW[0];
-    M[0] = (uint64_t)cc_M; uint64_t cy_M = (uint64_t)(cc_M >> 64);
-    for (int i=1; i<4; i++) { cc_M = (unsigned __int128)range_start[i] + halfW[i] + cy_M; M[i] = (uint64_t)cc_M; cy_M = (uint64_t)(cc_M >> 64); }
-    
-    unsigned __int128 cc = (unsigned __int128)M[0] + halfW[0]; 
-    M[0] = (uint64_t)cc; uint64_t cy = (uint64_t)(cc >> 64);
-    for (int i=1; i<4; i++) { cc = (unsigned __int128)M[i] + halfW[i] + cy; M[i] = (uint64_t)cc; cy = (uint64_t)(cc >> 64); }
+    int pow2W    = (int)std::round(std::log2l(W_ld));
+    int pow2Jmax = getPow2Jmax(Wsqrt / 2.0L);
+    int pow2dp   = std::max(0, (pow2W / 2) - 2);
+    uint32_t dp_mask = (uint32_t)((1ULL << pow2dp) - 1);
 
-    std::cout << std::left << std::setw(20) << "W (Keyspace)" << " : ~2^" << pow2W << "\n";
-    std::cout << std::left << std::setw(20) << "pow2dp" << " : " << pow2dp << "\n";
-    std::cout << std::left << std::setw(20) << "pow2Jmax" << " : " << pow2Jmax << "\n";
+    uint64_t halfW[4]; for(int i=0;i<4;i++) halfW[i]=W[i];
+    host_shr1_256(halfW);
+    uint64_t M[4]; host_add256(M, range_start, halfW);
 
-    uint64_t pubX[4]{0}, pubY[4]{0};
-    if (pubkey_hex.length() == 130) {
-        hexToLE64(pubkey_hex.substr(2, 64), pubX);
-        hexToLE64(pubkey_hex.substr(66, 64), pubY);
-    } else {
-        std::cerr << "Uncompressed pubkey expected for Kangaroo, strictly 130 hex characters.\n";
-        return 1;
-    }
+    std::cout << "[+] W  = 2^" << pow2W  << "\n";
+    std::cout << "[+] Jmax = 2^" << pow2Jmax << "\n";
+    std::cout << "[+] dp_mask = 2^" << pow2dp << "\n";
+    std::cout << "[+] M = " << formatHex256(M) << "\n";
 
-    uint32_t threadsTotal = 262144; 
-    uint32_t KANGAROOS_PER_THREAD = 8;
-    uint32_t TOTAL_KANGAROOS = threadsTotal * KANGAROOS_PER_THREAD;
-
-    uint64_t* h_start_scalars;
-    cudaHostAlloc(&h_start_scalars, TOTAL_KANGAROOS * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-    
-    uint64_t* h_dist;
-    cudaHostAlloc(&h_dist, TOTAL_KANGAROOS * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-    
-    // TAME (First half) and WILD (Second half)
-    for(uint32_t k=0; k < TOTAL_KANGAROOS/2; k++) {
-        uint64_t rT[4] = { (uint64_t)rand() | ((uint64_t)rand()<<32), (uint64_t)rand() | ((uint64_t)rand()<<32), 0, 0 }; 
-        uint64_t rW[4] = { (uint64_t)rand() | ((uint64_t)rand()<<32), (uint64_t)rand() | ((uint64_t)rand()<<32), 0, 0 }; 
-        // Mask offset to be smaller than W. If W < 2^128, rT[2]=rT[3]=0 is mostly fine. We'll mask to pow2W/2 bits roughly.
-        // It's just an offset.
-        int wsqrt_bits = pow2W / 2;
-        if (wsqrt_bits < 64) { rT[0] &= (1ULL << wsqrt_bits) - 1; rT[1]=0; rT[2]=0; rT[3]=0; }
-        else if (wsqrt_bits < 128) { rT[1] &= (1ULL << (wsqrt_bits-64)) - 1; rT[2]=0; rT[3]=0; }
-        
-        if (wsqrt_bits < 64) { rW[0] &= (1ULL << wsqrt_bits) - 1; rW[1]=0; rW[2]=0; rW[3]=0; }
-        else if (wsqrt_bits < 128) { rW[1] &= (1ULL << (wsqrt_bits-64)) - 1; rW[2]=0; rW[3]=0; }
-
-        uint64_t mT[4] = {M[0], M[1], M[2], M[3]};
-        unsigned __int128 cc_mT = (unsigned __int128)mT[0] + rT[0];
-        mT[0] = (uint64_t)cc_mT; uint64_t cy_mT = (uint64_t)(cc_mT >> 64);
-        for (int i=1; i<4; i++) { cc_mT = (unsigned __int128)mT[i] + rT[i] + cy_mT; mT[i] = (uint64_t)cc_mT; cy_mT = (uint64_t)(cc_mT >> 64); }
-
-        for(int i=0; i<4; i++) {
-            h_start_scalars[k*4 + i] = mT[i];
-            h_dist[k*4 + i] = rT[i]; // Tame distance initialized to rT
-
-            h_start_scalars[(TOTAL_KANGAROOS/2 + k)*4 + i] = rW[i]; 
-            h_dist[(TOTAL_KANGAROOS/2 + k)*4 + i] = rW[i]; // Wild distance initialized to rW
+    // ── parse pubkey ───────────────────────────────────────────────
+    uint64_t pubX[4]{}, pubY[4]{};
+    if (!decompressPubkey(pubkey_hex, pubX, pubY)) {
+        if (pubkey_hex.size() == 130 && pubkey_hex.substr(0,2) == "04") {
+            hexToLE64(pubkey_hex.substr(2, 64), pubX);
+            hexToLE64(pubkey_hex.substr(66, 64), pubY);
+        } else {
+            std::cerr << "Error: provide uncompressed pubkey (04...)\n";
+            return 1;
         }
     }
 
-    uint64_t *d_S, *d_Kx, *d_Ky, *d_Kdist;
+    // ── determine how many kangaroos fit in VRAM ────────────────────
+    size_t free_mem=0, total_mem=0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    // Each kangaroo consumes: X(32)+Y(32)+dist(32)+type(4) = 100 bytes
+    // Leave 10% for overhead
+    size_t usable = (size_t)(free_mem * 0.88);
+    const size_t per_k = (4+4+4)*sizeof(uint64_t) + sizeof(uint32_t); // 100 bytes
+    uint32_t TOTAL_KANGAROOS = (uint32_t)(usable / per_k);
+    // Round down to multiple of 512 (must be divisible by 2 and threads)
+    TOTAL_KANGAROOS = (TOTAL_KANGAROOS / 512) * 512;
+    if (TOTAL_KANGAROOS < 512) { TOTAL_KANGAROOS = 512; }
+    uint32_t KANGAROOS_PER_THREAD = 8;
+    if (TOTAL_KANGAROOS % KANGAROOS_PER_THREAD != 0) TOTAL_KANGAROOS -= TOTAL_KANGAROOS % KANGAROOS_PER_THREAD;
+    uint32_t threadsTotal = TOTAL_KANGAROOS / KANGAROOS_PER_THREAD;
+
+    std::cout << "[+] VRAM free = " << (free_mem/1024/1024) << " MB\n";
+    std::cout << "[+] Kangaroos = " << TOTAL_KANGAROOS << "  (threads=" << threadsTotal << ")\n";
+
+    // ── allocate GPU buffers ─────────────────────────────────────────
+    uint64_t *d_Kx, *d_Ky, *d_Kdist;
     uint32_t *d_Ktype;
-    cudaMalloc(&d_S, TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Kx, TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Ky, TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Kdist, TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Ktype, TOTAL_KANGAROOS * sizeof(uint32_t));
+    cudaMalloc(&d_Kx,    (size_t)TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
+    cudaMalloc(&d_Ky,    (size_t)TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
+    cudaMalloc(&d_Kdist, (size_t)TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
+    cudaMalloc(&d_Ktype, (size_t)TOTAL_KANGAROOS      * sizeof(uint32_t));
 
-    cudaMemcpy(d_S, h_start_scalars, TOTAL_KANGAROOS * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_Kdist, h_dist, TOTAL_KANGAROOS * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    
-    std::vector<uint32_t> h_types(TOTAL_KANGAROOS, DP_RECORD_TAME);
-    for(size_t i=TOTAL_KANGAROOS/2; i<TOTAL_KANGAROOS; i++) h_types[i] = DP_RECORD_WILD;
-    cudaMemcpy(d_Ktype, h_types.data(), TOTAL_KANGAROOS * sizeof(uint32_t), cudaMemcpyHostToDevice);
-
-    int blocks_scal = (TOTAL_KANGAROOS + 255) / 256;
-    scalarMulKernelBase<<<blocks_scal, 256>>>(d_S, d_Kx, d_Ky, TOTAL_KANGAROOS);
-    cudaDeviceSynchronize();
-
-    kernel_add_pubkey<<<blocks_scal / 2 + 1, 256>>>(d_Kx + (TOTAL_KANGAROOS/2)*4, d_Ky + (TOTAL_KANGAROOS/2)*4, 
-        pubX[0], pubX[1], pubX[2], pubX[3], pubY[0], pubY[1], pubY[2], pubY[3], TOTAL_KANGAROOS/2);
-    cudaDeviceSynchronize();
-
-    uint64_t* h_scalars_Sp;
-    cudaHostAlloc(&h_scalars_Sp, 256 * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-    memset(h_scalars_Sp, 0, 256 * 4 * sizeof(uint64_t));
-    for (int k = 0; k < 256; ++k) h_scalars_Sp[k*4 + (k/64)] = 1ULL << (k%64);
-    
-    uint64_t *d_scalars_Sp, *d_Gx_Sp, *d_Gy_Sp;
-    cudaMalloc(&d_scalars_Sp, 256 * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Gx_Sp, 256 * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_Gy_Sp, 256 * 4 * sizeof(uint64_t));
-    cudaMemcpy(d_scalars_Sp, h_scalars_Sp, 256 * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-    scalarMulKernelBase<<<1, 256>>>(d_scalars_Sp, d_Gx_Sp, d_Gy_Sp, 256);
-    cudaDeviceSynchronize();
-
-    uint64_t h_Gx_Sp[1024], h_Gy_Sp[1024];
-    cudaMemcpy(h_Gx_Sp, d_Gx_Sp, 256 * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_Gy_Sp, d_Gy_Sp, 256 * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    cudaMemcpyToSymbol(c_SpX, h_Gx_Sp, 256 * 4 * sizeof(uint64_t));
-    cudaMemcpyToSymbol(c_SpY, h_Gy_Sp, 256 * 4 * sizeof(uint64_t));
-
-    unsigned int MAX_DPS = 10000;
+    unsigned int MAX_DPS = 200000;
     DPRecord* d_dp_buffer;
     unsigned int* d_dp_count;
     cudaMalloc(&d_dp_buffer, MAX_DPS * sizeof(DPRecord));
-    cudaMalloc(&d_dp_count, sizeof(unsigned int));
-    cudaMemset(d_dp_count, 0, sizeof(unsigned int));
+    cudaMalloc(&d_dp_count,  sizeof(unsigned int));
 
-    struct DPInfo { int type; uint64_t distance[4]; };
-    std::unordered_map<uint64_t, DPInfo> CPU_DP_MAP;
-    
-    std::cout << "======== Phase-2: Execute Kangaroos ==================\n";
-    int blocks = threadsTotal / 256;
-    bool found = false;
-    uint64_t total_jumps = 0;
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    while(!found) {
-        kernel_kangaroo_jump<<<blocks, 256>>>(d_Kx, d_Ky, d_Kdist, d_Ktype, threadsTotal, KANGAROOS_PER_THREAD, slices, pow2Jmax, dp_mask_lsb, d_dp_buffer, d_dp_count, MAX_DPS);
+    // ── build jump point table c_SpX / c_SpY ─────────────────────────
+    {
+        size_t jpCount = (size_t)std::min(pow2Jmax, (int)MAX_JUMP_POINTS);
+        std::vector<uint64_t> h_scalars(jpCount * 4, 0);
+        for (size_t k = 0; k < jpCount; ++k) {
+            // 2^k as uint256 little-endian
+            int bit = (int)k;
+            h_scalars[k*4 + (bit/64)] = 1ULL << (bit%64);
+        }
+        uint64_t *d_sp_s, *d_sp_x, *d_sp_y;
+        cudaMalloc(&d_sp_s, jpCount*4*sizeof(uint64_t));
+        cudaMalloc(&d_sp_x, jpCount*4*sizeof(uint64_t));
+        cudaMalloc(&d_sp_y, jpCount*4*sizeof(uint64_t));
+        cudaMemcpy(d_sp_s, h_scalars.data(), jpCount*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
+        scalarMulKernelBase<<<((int)jpCount+255)/256, 256>>>(d_sp_s, d_sp_x, d_sp_y, (int)jpCount);
         cudaDeviceSynchronize();
-        total_jumps += TOTAL_KANGAROOS * slices;
+        std::vector<uint64_t> h_SpX(jpCount*4), h_SpY(jpCount*4);
+        cudaMemcpy(h_SpX.data(), d_sp_x, jpCount*4*sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_SpY.data(), d_sp_y, jpCount*4*sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        cudaMemcpyToSymbol(c_SpX, h_SpX.data(), jpCount*4*sizeof(uint64_t));
+        cudaMemcpyToSymbol(c_SpY, h_SpY.data(), jpCount*4*sizeof(uint64_t));
+        cudaFree(d_sp_s); cudaFree(d_sp_x); cudaFree(d_sp_y);
+    }
+    std::cout << "[+] Jump table ready (2^0..2^" << (pow2Jmax-1) << ")\n";
 
+    // ── distributed point storage on CPU ──────────────────────────────
+    struct DPInfo { int type; uint64_t distance[4]; };
+    std::unordered_map<uint64_t, DPInfo> dp_map;
+    dp_map.reserve(1 << 20);
+
+    uint32_t restart_count = 0;
+    bool found = false;
+    uint64_t target_privatekey[4]{};
+
+    auto do_restart = [&]() {
+        restart_count++;
+        std::cout << "\n[#] Restart #" << restart_count << "  — resetting kangaroo positions\n";
+
+        // Allocate host arrays for initial scalars (tame) and offsets (wild)
+        std::mt19937_64 rng(std::chrono::steady_clock::now().time_since_epoch().count() + restart_count);
+
+        uint32_t half = TOTAL_KANGAROOS / 2;
+
+        std::vector<uint64_t> h_scalars(TOTAL_KANGAROOS * 4);
+        std::vector<uint64_t> h_dist(TOTAL_KANGAROOS * 4, 0);
+        std::vector<uint32_t> h_types(TOTAL_KANGAROOS);
+
+        int wsqrt_bits = pow2W / 2;
+        uint64_t rand_mask0 = (wsqrt_bits < 64) ? ((1ULL << wsqrt_bits) - 1) : 0xFFFFFFFFFFFFFFFFULL;
+        uint64_t rand_mask1 = (wsqrt_bits < 64)  ? 0 : (wsqrt_bits < 128 ? ((1ULL << (wsqrt_bits-64)) - 1) : 0xFFFFFFFFFFFFFFFFULL);
+
+        // Tame: start at M + randT,  dist = randT
+        for (uint32_t k = 0; k < half; ++k) {
+            uint64_t rT[4] = { rng() & rand_mask0, rng() & rand_mask1, 0, 0 };
+            uint64_t mT[4]; host_add256(mT, M, rT);
+            for (int i=0;i<4;i++) h_scalars[k*4+i] = mT[i];
+            for (int i=0;i<4;i++) h_dist[k*4+i]    = rT[i];
+            h_types[k] = DP_RECORD_TAME;
+        }
+        // Wild: start at randW * G + pubkey,  we store scalar = randW; dist = randW
+        for (uint32_t k = half; k < TOTAL_KANGAROOS; ++k) {
+            uint64_t rW[4] = { rng() & rand_mask0, rng() & rand_mask1, 0, 0 };
+            for (int i=0;i<4;i++) h_scalars[k*4+i] = rW[i];
+            for (int i=0;i<4;i++) h_dist[k*4+i]    = rW[i];
+            h_types[k] = DP_RECORD_WILD;
+        }
+
+        cudaMemcpy(d_Ktype, h_types.data(), TOTAL_KANGAROOS*sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_Kdist, h_dist.data(),  TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+        // scalarMulKernelBase computes k*G
+        uint64_t *d_tmp_s; cudaMalloc(&d_tmp_s, (size_t)TOTAL_KANGAROOS*4*sizeof(uint64_t));
+        cudaMemcpy(d_tmp_s, h_scalars.data(), TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
+        scalarMulKernelBase<<<(TOTAL_KANGAROOS+255)/256, 256>>>(d_tmp_s, d_Kx, d_Ky, TOTAL_KANGAROOS);
+        cudaDeviceSynchronize();
+        cudaFree(d_tmp_s);
+
+        // Add pubkey to Wild kangaroos: Kx[half..] += pubkey  (i.e. P+randW*G)
+        // We do this with a small kernel
+        kernel_add_pubkey<<<(half+255)/256, 256>>>(
+            d_Kx + (size_t)half*4, d_Ky + (size_t)half*4,
+            pubX[0], pubX[1], pubX[2], pubX[3],
+            pubY[0], pubY[1], pubY[2], pubY[3], half);
+        cudaDeviceSynchronize();
+
+        cudaMemset(d_dp_count, 0, sizeof(unsigned int));
+        dp_map.clear();
+    };
+
+    // Initial setup
+    do_restart();
+    restart_count = 0; // reset counter (first run)
+
+    std::cout << "[+] Running Kangaroos...\n";
+    int blocks = (threadsTotal + 255) / 256;
+    uint64_t total_jumps = 0;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto t_last = t0;
+
+    while (!found) {
+        kernel_kangaroo_jump<<<blocks, 256>>>(
+            d_Kx, d_Ky, d_Kdist, d_Ktype,
+            threadsTotal, KANGAROOS_PER_THREAD, slices,
+            (uint32_t)(1 << pow2Jmax), dp_mask,
+            d_dp_buffer, d_dp_count, MAX_DPS);
+        cudaDeviceSynchronize();
+        total_jumps += (uint64_t)TOTAL_KANGAROOS * slices;
+
+        // ── harvest DPs ─────────────────
         unsigned int dps = 0;
         cudaMemcpy(&dps, d_dp_count, sizeof(unsigned int), cudaMemcpyDeviceToHost);
         if (dps > MAX_DPS) dps = MAX_DPS;
 
         if (dps > 0) {
-            DPRecord* host_dps = new DPRecord[dps];
-            cudaMemcpy(host_dps, d_dp_buffer, dps * sizeof(DPRecord), cudaMemcpyDeviceToHost);
+            std::vector<DPRecord> host_dps(dps);
+            cudaMemcpy(host_dps.data(), d_dp_buffer, dps*sizeof(DPRecord), cudaMemcpyDeviceToHost);
             cudaMemset(d_dp_count, 0, sizeof(unsigned int));
 
-            for(size_t i=0; i<dps; i++) {
-                uint64_t key = host_dps[i].X[0];
-                if (CPU_DP_MAP.find(key) != CPU_DP_MAP.end()) {
-                    auto existing = CPU_DP_MAP[key];
-                    if (existing.type != host_dps[i].type) {
+            for (auto& dp : host_dps) {
+                uint64_t key = dp.X[0];
+                auto it = dp_map.find(key);
+                if (it != dp_map.end()) {
+                    auto& ex = it->second;
+                    if (ex.type != (int)dp.type) {
+                        // Collision!
+                        const uint64_t* D_T = (ex.type == DP_RECORD_TAME) ? ex.distance : dp.distance;
+                        const uint64_t* D_W = (ex.type == DP_RECORD_WILD) ? ex.distance : dp.distance;
+
+                        // PrivKey = M + D_T - D_W
+                        uint64_t tmp[4]; host_add256(tmp, M, D_T);
+                        host_sub256(target_privatekey, tmp, D_W);
                         found = true;
-                        std::cout << "\nCOLLISION DETECTED! Tame and Wild paths converged.\n";
-                        uint64_t tame_dist[4], wild_dist[4];
-                        if (existing.type == DP_RECORD_TAME) {
-                            for(int j=0; j<4; j++) tame_dist[j] = existing.distance[j];
-                            for(int j=0; j<4; j++) wild_dist[j] = host_dps[i].distance[j];
-                        } else {
-                            for(int j=0; j<4; j++) wild_dist[j] = existing.distance[j];
-                            for(int j=0; j<4; j++) tame_dist[j] = host_dps[i].distance[j];
-                        }
-                        
-                        uint64_t target_key_calc[4];
-                        // M + D_T = PrivateKey + D_W => PrivateKey = M + D_T - D_W
-                        uint64_t MT[4] = {M[0], M[1], M[2], M[3]};
-                        unsigned __int128 cc_MT = (unsigned __int128)MT[0] + tame_dist[0];
-                        MT[0] = (uint64_t)cc_MT; uint64_t cy_MT = (uint64_t)(cc_MT >> 64);
-                        for (int j=1; j<4; j++) { cc_MT = (unsigned __int128)MT[j] + tame_dist[j] + cy_MT; MT[j] = (uint64_t)cc_MT; cy_MT = (uint64_t)(cc_MT >> 64); }
-                        
-                        // We need sub256 for MT - D_W. Let's use CPU arithmetic.
-                        uint64_t borrow = 0;
-                        for(int j=0; j<4; ++j) {
-                            uint64_t b_val = wild_dist[j] + borrow;
-                            if (MT[j] < b_val) {
-                                target_key_calc[j] = (uint64_t)((((unsigned __int128)1)<<64) + MT[j] - b_val);
-                                borrow = 1;
-                            } else {
-                                target_key_calc[j] = MT[j] - b_val;
-                                borrow = 0;
-                            }
-                        }
-                        
-                        std::cout << "\n-------------------------------------------------\n";
-                        std::cout << "FOUND PRIVATE KEY: " << formatHex256(target_key_calc) << "\n";
-                        std::cout << "-------------------------------------------------\n";
-                        
-                        cudaFreeHost(h_start_scalars);
-                        cudaFreeHost(h_dist);
-                        cudaFreeHost(h_scalars_Sp);
-                        cudaFree(d_S); cudaFree(d_Kx); cudaFree(d_Ky); cudaFree(d_Kdist); cudaFree(d_Ktype);
-                        cudaFree(d_scalars_Sp); cudaFree(d_Gx_Sp); cudaFree(d_Gy_Sp);
-                        cudaFree(d_dp_buffer); cudaFree(d_dp_count);
-                        return 0;
+                        break;
                     }
                 } else {
-                    DPInfo info;
-                    info.type = host_dps[i].type;
-                    for(int j=0; j<4;j++) info.distance[j] = host_dps[i].distance[j];
-                    CPU_DP_MAP[key] = info;
+                    DPInfo info; info.type = dp.type;
+                    for(int i=0;i<4;i++) info.distance[i] = dp.distance[i];
+                    dp_map[key] = info;
                 }
             }
-            delete[] host_dps;
         }
 
+        // ── progress display ─────────────────
         auto now = std::chrono::high_resolution_clock::now();
-        double elapsed = std::chrono::duration<double>(now - start_time).count();
-        std::cout << "\rSpeed: " << std::fixed << std::setprecision(1) << (total_jumps/elapsed)/1e6 << " Mjumps/s | DPs: " << CPU_DP_MAP.size() << std::flush;
-        
-        if (found) break;
+        double elapsed = std::chrono::duration<double>(now - t0).count();
+        double since   = std::chrono::duration<double>(now - t_last).count();
+        if (since > 1.0 || found) {
+            t_last = now;
+            double jps = total_jumps / elapsed;
+            double progress = (total_jumps / ((double)TOTAL_KANGAROOS)) / (2.0 * Wsqrt) * 100.0;
+            std::cout << "\r[" << std::fixed << std::setprecision(0) << elapsed << "s] "
+                      << std::fixed << std::setprecision(1) << jps/1e6 << " Mj/s | "
+                      << "DPs=" << dp_map.size()
+                      << " | Est: " << std::setprecision(1) << progress << "% "
+                      << " | Restarts=" << restart_count
+                      << "    " << std::flush;
+        }
+
+        // ── auto-restart if no solution after ~4*sqrt(W) jumps ─────────
+        if (!found && total_jumps > (uint64_t)(4.0L * Wsqrt * TOTAL_KANGAROOS)) {
+            do_restart();
+            total_jumps = 0;
+            t0 = std::chrono::high_resolution_clock::now();
+            t_last = t0;
+        }
     }
 
+    std::cout << "\n\n";
+    std::cout << "====================================================\n";
+    std::cout << "  FOUND PRIVATE KEY: " << formatHex256(target_privatekey) << "\n";
+    std::cout << "====================================================\n";
+
+    // Save to file
+    {
+        std::ofstream f("found.txt", std::ios::app);
+        f << "Private Key: " << formatHex256(target_privatekey)
+          << "  Range: " << range_hex
+          << "  Pubkey: " << pubkey_hex << "\n";
+    }
+    std::cout << "[+] Saved to found.txt\n";
+
+    cudaFree(d_Kx); cudaFree(d_Ky); cudaFree(d_Kdist); cudaFree(d_Ktype);
+    cudaFree(d_dp_buffer); cudaFree(d_dp_count);
     return 0;
 }

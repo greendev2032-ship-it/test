@@ -382,19 +382,11 @@ extern bool decode_p2pkh_address(const std::string& addr, uint8_t out20[20]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
-/* Kangaroo mode entry point (defined in CUDAKangaroo.cu) */
-extern int kangaroo_main(int argc, char** argv);
-
 int main(int argc, char** argv) {
-    /* Check for --kangaroo flag first */
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--kangaroo") {
-            return kangaroo_main(argc, argv);
-        }
-    }
-
     std::signal(SIGINT, handle_sigint);
 
+    bool use_kangaroo = false;
+    std::string pubkey_hex;
     std::string target_hash_hex, range_hex, address_b58;
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
@@ -424,7 +416,9 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "--target-hash160" && i + 1 < argc) target_hash_hex = argv[++i];
+        if (arg == "--kangaroo") use_kangaroo = true;
+        else if (arg == "--pubkey" && i + 1 < argc) pubkey_hex = argv[++i];
+        else if (arg == "--target-hash160" && i + 1 < argc) target_hash_hex = argv[++i];
         else if (arg == "--address"        && i + 1 < argc) address_b58     = argv[++i];
         else if (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
         else if (arg == "--grid"           && i + 1 < argc) {
@@ -447,9 +441,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
+    if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty() && pubkey_hex.empty())) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]\n";
+                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex> | --pubkey <pubkey_hex>) [--grid A,B] [--slices N] [--kangaroo]\n";
         return EXIT_FAILURE;
     }
     if (!target_hash_hex.empty() && !address_b58.empty()) {
@@ -472,10 +466,20 @@ int main(int argc, char** argv) {
         if (!decode_p2pkh_address(address_b58, target_hash160)) {
             std::cerr << "Error: invalid P2PKH address\n"; return EXIT_FAILURE;
         }
-    } else {
+    } else if (!target_hash_hex.empty()) {
         if (!hexToHash160(target_hash_hex, target_hash160)) {
             std::cerr << "Error: invalid target hash160 hex\n"; return EXIT_FAILURE;
         }
+    }
+
+    extern int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex, uint32_t a, uint32_t b, uint32_t slices);
+
+    if (use_kangaroo) {
+        if (pubkey_hex.empty()) {
+            std::cerr << "Error: --kangaroo requires --pubkey to be provided.\n";
+            return EXIT_FAILURE;
+        }
+        return runKangaroo(range_hex, pubkey_hex, runtime_points_batch_size, runtime_batches_per_sm, slices_per_launch);
     }
 
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };

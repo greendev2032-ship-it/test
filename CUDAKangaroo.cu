@@ -52,34 +52,85 @@ static void host_shr1_256(uint64_t a[4]) {
     a[3] >>= 1;
 }
 
-// Decompress a '02'/'03' pubkey to X, Y in little-endian uint64 arrays.
-// Returns false if format is invalid.
+// ── secp256k1 prime: p = 2^256 - 2^32 - 977 ─────────────────────────
+static const uint64_t CPU_P[4] = {
+    0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
+};
+static void cpu_modsub256(const uint64_t a[4], const uint64_t b[4], uint64_t r[4]) {
+    uint64_t borrow=0;
+    for(int i=0;i<4;i++){
+        uint64_t bi=b[i]+borrow;
+        if(a[i]<bi){r[i]=(uint64_t)((((unsigned __int128)1)<<64)+a[i]-bi);borrow=1;}
+        else{r[i]=a[i]-bi;borrow=0;}
+    }
+    if(borrow){ unsigned __int128 c=0; for(int i=0;i<4;i++){c=(unsigned __int128)r[i]+CPU_P[i]+(c>>64);r[i]=(uint64_t)c;} }
+}
+static void cpu_modadd256(const uint64_t a[4], const uint64_t b[4], uint64_t r[4]) {
+    unsigned __int128 c=0;
+    for(int i=0;i<4;i++){c=(unsigned __int128)a[i]+b[i]+(c>>64);r[i]=(uint64_t)c;}
+    bool ge=(c>>64)>0;
+    if(!ge){for(int i=3;i>=0;i--){if(r[i]>CPU_P[i]){ge=true;break;}if(r[i]<CPU_P[i])break;}}
+    if(ge){uint64_t bw=0;for(int i=0;i<4;i++){uint64_t bi=CPU_P[i]+bw;if(r[i]<bi){r[i]=(uint64_t)((((unsigned __int128)1)<<64)+r[i]-bi);bw=1;}else{r[i]-=bi;bw=0;}}}
+}
+static void cpu_reduce512(uint64_t full[8], uint64_t out[4]) {
+    static const uint64_t K = 0x1000003D1ULL;
+    unsigned __int128 acc=0; unsigned __int128 carry=0;
+    uint64_t hi[5]={};
+    for(int i=0;i<4;i++){acc=(unsigned __int128)full[i+4]*K+(acc>>64);hi[i]=(uint64_t)acc;}
+    hi[4]=(uint64_t)(acc>>64);
+    acc=0;
+    for(int i=0;i<4;i++){acc=(unsigned __int128)full[i]+hi[i]+(acc>>64);out[i]=(uint64_t)acc;}
+    uint64_t c=(uint64_t)(acc>>64)+hi[4];
+    if(c){acc=(unsigned __int128)c*K;uint64_t add=(uint64_t)acc,cy2=(uint64_t)(acc>>64),prev=0;
+        for(int i=0;i<4;i++){acc=(unsigned __int128)out[i]+(i==0?add:0)+(i==0?cy2:prev)+(acc>>64);out[i]=(uint64_t)acc;prev=0;}}
+    bool ge=false;
+    for(int i=3;i>=0;i--){if(out[i]>CPU_P[i]){ge=true;break;}if(out[i]<CPU_P[i])break;}
+    if(ge){uint64_t bw=0;for(int i=0;i<4;i++){uint64_t bi=CPU_P[i]+bw;if(out[i]<bi){out[i]=(uint64_t)((((unsigned __int128)1)<<64)+out[i]-bi);bw=1;}else{out[i]-=bi;bw=0;}}}
+}
+static void cpu_modmul256(const uint64_t a[4], const uint64_t b[4], uint64_t r[4]) {
+    uint64_t full[8]={};
+    unsigned __int128 carry;
+    for(int i=0;i<4;i++){carry=0;for(int j=0;j<4;j++){unsigned __int128 p=(unsigned __int128)a[i]*b[j]+full[i+j]+carry;full[i+j]=(uint64_t)p;carry=p>>64;}full[i+4]+=carry;}
+    cpu_reduce512(full,r);
+}
+static void cpu_modsqr256(const uint64_t a[4], uint64_t r[4]){ cpu_modmul256(a,a,r); }
+static void cpu_modexp256(const uint64_t base[4], const uint64_t exp[4], uint64_t r[4]) {
+    uint64_t res[4]={1,0,0,0}, b[4]; for(int i=0;i<4;i++) b[i]=base[i];
+    for(int i=0;i<256;i++){if((exp[i/64]>>(i%64))&1){cpu_modmul256(res,b,res);}cpu_modsqr256(b,b);}
+    for(int i=0;i<4;i++) r[i]=res[i];
+}
+// Decompress a '02'/'03' or '04' pubkey to X, Y in little-endian uint64 arrays.
 static bool decompressPubkey(const std::string& hex, uint64_t X[4], uint64_t Y[4]) {
-    if (hex.size() == 130 && hex.substr(0,2) == "04") {
+    if (hex.size() == 130) {
         hexToLE64(hex.substr(2, 64), X);
         hexToLE64(hex.substr(66, 64), Y);
         return true;
     }
-    // Compressed
     if (hex.size() != 66) return false;
     int prefix = std::stoi(hex.substr(0,2), nullptr, 16);
     if (prefix != 0x02 && prefix != 0x03) return false;
+    int y_parity = prefix & 1; // 02=even=0, 03=odd=1
     hexToLE64(hex.substr(2, 64), X);
 
-    // Secp256k1 p
-    static const uint64_t P[4] = {0xFFFFFFFEFFFFFC2FULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL,0xFFFFFFFFFFFFFFFFULL};
-    // y² = x³ + 7 (mod p), we need Y on device - use Python logic on CPU
-    // For simplicity, use a small GPU call: compute Y using scalarMulBaseAffine indirectly.
-    // Actually we only need Y from X using x^3 + 7 mod p on CPU with __int128.
-    // We'll do it using Tonelli–Shanks exponent (p+1)/4 since p≡3 mod 4.
-    // (p+1)/4 = 0x3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c
-    // Use bignum with uint64_t[4].
-    // Defer: pass X, compute Y on GPU indirectly via a helper.
-    // For now a simplified path using device later.
-    // STUB: just set Y to 0 and let user pass uncompressed.
-    Y[0]=Y[1]=Y[2]=Y[3]=0;
-    std::cerr << "[warn] Compressed pubkey support: Y coordinate not computed. Please use uncompressed (04...) pubkey for now.\n";
-    return false;
+    // y = (x^3 + 7)^((p+1)/4) mod p
+    uint64_t x2[4], x3[4], rhs[4], seven[4]={7,0,0,0};
+    cpu_modsqr256(X, x2);
+    cpu_modmul256(X, x2, x3);
+    cpu_modadd256(x3, seven, rhs);
+
+    // (p+1)/4 in little-endian
+    uint64_t exp[4] = {
+        0xFFFFFFFFBFFFFF0CULL,
+        0xFFFFFFFFFFFFFFFFULL,
+        0xFFFFFFFFFFFFFFFFULL,
+        0x3FFFFFFFFFFFFFFFULL
+    };
+    cpu_modexp256(rhs, exp, Y);
+
+    // adjust parity
+    if ((int)(Y[0] & 1) != y_parity) cpu_modsub256(CPU_P, Y, Y);
+    return true;
 }
 
 int getPow2Jmax(long double optimalmeanjumpsize) {
@@ -148,19 +199,20 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     size_t free_mem=0, total_mem=0;
     cudaMemGetInfo(&free_mem, &total_mem);
     // Each kangaroo consumes: X(32)+Y(32)+dist(32)+type(4) = 100 bytes
-    // Leave 10% for overhead
-    size_t usable = (size_t)(free_mem * 0.88);
+    // Use 70% of VRAM to leave headroom for initialization (scalarMul uses d_Kdist as temp)
+    size_t usable = (size_t)(free_mem * 0.70);
     const size_t per_k = (4+4+4)*sizeof(uint64_t) + sizeof(uint32_t); // 100 bytes
     uint32_t TOTAL_KANGAROOS = (uint32_t)(usable / per_k);
     // Round down to multiple of 512 (must be divisible by 2 and threads)
     TOTAL_KANGAROOS = (TOTAL_KANGAROOS / 512) * 512;
     if (TOTAL_KANGAROOS < 512) { TOTAL_KANGAROOS = 512; }
-    uint32_t KANGAROOS_PER_THREAD = 8;
+    const uint32_t KANGAROOS_PER_THREAD = 8;
     if (TOTAL_KANGAROOS % KANGAROOS_PER_THREAD != 0) TOTAL_KANGAROOS -= TOTAL_KANGAROOS % KANGAROOS_PER_THREAD;
     uint32_t threadsTotal = TOTAL_KANGAROOS / KANGAROOS_PER_THREAD;
 
-    std::cout << "[+] VRAM free = " << (free_mem/1024/1024) << " MB\n";
-    std::cout << "[+] Kangaroos = " << TOTAL_KANGAROOS << "  (threads=" << threadsTotal << ")\n";
+    std::cout << "[+] VRAM free     = " << (free_mem/1024/1024) << " MB\n";
+    std::cout << "[+] Kangaroos     = " << TOTAL_KANGAROOS << "  (threads=" << threadsTotal << ")\n";
+    std::cout << "[+] Each kangaroo = " << per_k << " bytes | Total = " << (per_k*(size_t)TOTAL_KANGAROOS/1024/1024) << " MB\n";
 
     // ── allocate GPU buffers ─────────────────────────────────────────
     uint64_t *d_Kx, *d_Ky, *d_Kdist;
@@ -169,6 +221,14 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
     cudaMalloc(&d_Ky,    (size_t)TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
     cudaMalloc(&d_Kdist, (size_t)TOTAL_KANGAROOS * 4 * sizeof(uint64_t));
     cudaMalloc(&d_Ktype, (size_t)TOTAL_KANGAROOS      * sizeof(uint32_t));
+
+    // Verify allocations succeeded
+    cudaError_t cerr = cudaGetLastError();
+    if (cerr != cudaSuccess) {
+        std::cerr << "[ERROR] GPU buffer allocation failed: " << cudaGetErrorString(cerr)
+                  << " (tried " << (per_k*(size_t)TOTAL_KANGAROOS/1024/1024) << " MB)\n";
+        return 1;
+    }
 
     unsigned int MAX_DPS = 200000;
     DPRecord* d_dp_buffer;
@@ -244,14 +304,16 @@ int runKangaroo(const std::string& range_hex, const std::string& pubkey_hex,
         }
 
         cudaMemcpy(d_Ktype, h_types.data(), TOTAL_KANGAROOS*sizeof(uint32_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_Kdist, h_dist.data(),  TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-        // scalarMulKernelBase computes k*G
-        uint64_t *d_tmp_s; cudaMalloc(&d_tmp_s, (size_t)TOTAL_KANGAROOS*4*sizeof(uint64_t));
-        cudaMemcpy(d_tmp_s, h_scalars.data(), TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
-        scalarMulKernelBase<<<(TOTAL_KANGAROOS+255)/256, 256>>>(d_tmp_s, d_Kx, d_Ky, TOTAL_KANGAROOS);
+        // Use d_Kdist as temporary scalar buffer (will be overwritten with real distances next)
+        cudaMemcpy(d_Kdist, h_scalars.data(), TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
+        scalarMulKernelBase<<<(TOTAL_KANGAROOS+255)/256, 256>>>(d_Kdist, d_Kx, d_Ky, TOTAL_KANGAROOS);
         cudaDeviceSynchronize();
-        cudaFree(d_tmp_s);
+        // Now overwrite d_Kdist with the real initial distances
+        cudaMemcpy(d_Kdist, h_dist.data(), TOTAL_KANGAROOS*4*sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+        cerr = cudaGetLastError();
+        if (cerr != cudaSuccess) std::cerr << "[WARN] scalarMul error: " << cudaGetErrorString(cerr) << "\n";
 
         // Add pubkey to Wild kangaroos: Kx[half..] += pubkey  (i.e. P+randW*G)
         // We do this with a small kernel

@@ -43,7 +43,7 @@ __host__ __forceinline__ void inc256(uint64_t a[4], uint64_t inc) {
     }
 }
 
-__host__ void divmod_256_by_u64(const uint64_t value[4], uint64_t divisor, uint64_t quotient[4], uint64_t &remainder) {
+static __host__ inline void divmod_256_by_u64(const uint64_t value[4], uint64_t divisor, uint64_t quotient[4], uint64_t &remainder) {
     remainder = 0;
     for (int i = 3; i >= 0; --i) {
         __uint128_t cur = (__uint128_t(remainder) << 64) | value[i];
@@ -52,7 +52,7 @@ __host__ void divmod_256_by_u64(const uint64_t value[4], uint64_t divisor, uint6
     }
 }
 
-bool hexToLE64(const std::string& h_in, uint64_t w[4]) {
+static inline bool hexToLE64(const std::string& h_in, uint64_t w[4]) {
     std::string h = h_in;
     if (h.size() >= 2 && (h[0] == '0') && (h[1] == 'x' || h[1] == 'X')) h = h.substr(2);
     if (h.size() > 64) return false;
@@ -64,7 +64,7 @@ bool hexToLE64(const std::string& h_in, uint64_t w[4]) {
     }
     return true;
 }
-bool hexToHash160(const std::string& h, uint8_t hash160[20]) {
+static inline bool hexToHash160(const std::string& h, uint8_t hash160[20]) {
     if (h.size() != 40) return false;
     for (int i = 0; i < 20; ++i) {
         std::string byteStr = h.substr(i * 2, 2);
@@ -72,7 +72,7 @@ bool hexToHash160(const std::string& h, uint8_t hash160[20]) {
     }
     return true;
 }
-std::string formatHex256(const uint64_t limbs[4]) {
+static inline std::string formatHex256(const uint64_t limbs[4]) {
     std::ostringstream oss;
     oss << std::hex << std::uppercase << std::setfill('0');
     for (int i = 3; i >= 0; --i) {
